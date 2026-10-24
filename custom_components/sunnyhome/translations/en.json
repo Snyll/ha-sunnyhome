@@ -1,0 +1,71 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to SunnyHome",
+        "description": "SunnyHome is a monitoring and automation service for solar homes. This integration sends SunnyHome the live values of your SolaX Modbus inverter every 10 s, and the switches, lights and sensors you choose later under Configure. SunnyHome can then show them on its dashboard, use them in automation rules and, only if you allow it, switch the devices you tick. HA connects out to SunnyHome only; nothing is opened to the internet.\n\nTo pair: in SunnyHome, open your account, choose **Connect Home Assistant** and enter the code shown there.",
+        "data": {
+          "url": "SunnyHome address",
+          "code": "Pairing code"
+        },
+        "data_description": {
+          "url": "Leave the default unless you run a development server.",
+          "code": "8 characters, shown as XXXX-XXXX. Valid for 10 minutes and usable once."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Pair with SunnyHome again",
+        "description": "SunnyHome no longer accepts this installation, for example because it was unlinked. Choose Connect Home Assistant in SunnyHome and enter the new code.",
+        "data": {
+          "code": "Pairing code"
+        }
+      }
+    },
+    "error": {
+      "invalid_url": "Enter an https address. http is allowed only for localhost, 127.0.0.1 and host.docker.internal.",
+      "invalid_code": "The code must have 8 characters, for example AB12-CD34.",
+      "pairing_invalid": "The code is wrong, expired or already used. Get a new code in SunnyHome.",
+      "link_limit": "This SunnyHome account already has the maximum number of Home Assistant connections. Unlink one in SunnyHome first.",
+      "cannot_connect": "Could not reach SunnyHome. Check the address and try again later."
+    },
+    "abort": {
+      "already_configured": "This SunnyHome connection is already configured.",
+      "reauth_successful": "Paired with SunnyHome again."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Devices shared with SunnyHome",
+        "description": "Only the ticked switches and lights are shared with SunnyHome: their name, state and brightness. SolaX Modbus entities are never offered.\n\n**Control:** SunnyHome can switch on and off, and dim, the devices ticked under \"Devices SunnyHome may control\" once control is also allowed for this connection in SunnyHome. Never tick a switch of an inverter, battery or EV charger there.\n\n**Sensors:** SunnyHome receives the value, unit and time of the temperature, power and energy sensors ticked under \"Sensors SunnyHome may read\", for its automation rules.",
+        "data": {
+          "entities": "Shared devices",
+          "control": "Devices SunnyHome may control",
+          "sensors": "Sensors SunnyHome may read"
+        },
+        "data_description": {
+          "control": "Each must also be ticked under Shared devices. Leave empty and SunnyHome controls nothing.",
+          "sensors": "At most 32. Leave empty and SunnyHome reads no sensors."
+        }
+      },
+      "inverter": {
+        "title": "Inverter control",
+        "description": "**Warning: this lets SunnyHome charge and discharge your home battery through the SolaX inverter.**\n\nWhen on, SunnyHome may put the inverter of your SolaX Modbus hub into a remote battery mode for 2 to 10 minutes at a time: charge or discharge at up to 1500 W, hold the battery, or don't discharge it (it may still charge from solar). It uses only the hub's direct remote-control entities and only these modes. Nothing is sent unless SunnyHome has verified your inverter model, firmware and SolaX Modbus version, and you also allow inverter control in SunnyHome.\n\nHome Assistant ends the mode itself when SunnyHome stops renewing it, also after a restart. If Home Assistant stops reporting for 3 minutes while a mode runs, SunnyHome ends the mode through the SolaX cloud, as long as its SolaX cloud connection to your plant works and inverter control is allowed in SunnyHome. Otherwise the mode keeps running until Home Assistant is back and ends it; the inverter's own timeout did not end it in our test. If something else controls the inverter remotely (another energy manager or automation), SunnyHome does not start a mode, and it steps back when it sees another mode. Turning this off ends an active mode at once.",
+        "data": {
+          "inverter_control": "Allow SunnyHome to control the inverter's battery mode"
+        }
+      }
+    },
+    "error": {
+      "too_many": "Choose at most 64 devices.",
+      "control_not_shared": "Devices SunnyHome may control must also be ticked as shared devices.",
+      "too_many_sensors": "Choose at most 32 sensors."
+    }
+  },
+  "issues": {
+    "multiple_hubs": {
+      "title": "Several inverter integrations are not supported yet",
+      "description": "SunnyHome found more than one inverter integration entry (SolaX Modbus, GoodWe or Deye), so it sends no inverter data. Keep a single one to resume sending."
+    }
+  }
+}

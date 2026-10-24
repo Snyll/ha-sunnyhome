@@ -1,0 +1,109 @@
+{
+  "contract": "inverter-settings-v1",
+  "profile": "home_assistant.solax_modbus",
+  "source": "home_assistant",
+  "vendor": "solax",
+  "note": "Home Assistant solax_modbus hub shared with the SunnyHome component. entity: <domain>.<key after the hub prefix>; values: HA option string -> catalog code.",
+  "staleSeconds": 300,
+  "settings": {
+    "work_mode": {
+      "entity": "select.charger_use_mode",
+      "values": {
+        "Self Use Mode": "self_use",
+        "Feedin Priority": "feed_in",
+        "Back Up Mode": "backup",
+        "Manual Mode": "manual",
+        "PeakShaving": "peak_shaving",
+        "Smart Schedule": "tou"
+      },
+      "unverified": true
+    },
+    "manual_mode": {
+      "entity": "select.manual_mode_select",
+      "values": {
+        "Stop Charge and Discharge": "stop",
+        "Force Charge": "force_charge",
+        "Force Discharge": "force_discharge"
+      },
+      "unverified": true
+    },
+    "selfuse_min_soc": {
+      "entity": "number.selfuse_discharge_min_soc"
+    },
+    "selfuse_grid_charge": {
+      "entity": "switch.selfuse_night_charge_enable"
+    },
+    "selfuse_grid_charge_upper_soc": {
+      "entity": "number.selfuse_nightcharge_upper_soc"
+    },
+    "selfuse_backup_enabled": {
+      "entity": "switch.selfuse_mode_backup"
+    },
+    "selfuse_backup_soc": {
+      "entity": "number.selfuse_backup_soc"
+    },
+    "feedin_min_soc": {
+      "entity": "number.feedin_discharge_min_soc"
+    },
+    "feedin_grid_charge_upper_soc": {
+      "entity": "number.feedin_nightcharge_upper_soc"
+    },
+    "backup_min_soc": {
+      "entity": "number.backup_discharge_min_soc"
+    },
+    "backup_grid_charge_upper_soc": {
+      "entity": "number.backup_nightcharge_upper_soc"
+    },
+    "charge_period1_start": {
+      "entity": "time.charge_start_1"
+    },
+    "charge_period1_end": {
+      "entity": "time.charge_end_1"
+    },
+    "discharge_period1_start": {
+      "entity": "time.discharge_start_1"
+    },
+    "discharge_period1_end": {
+      "entity": "time.discharge_end_1"
+    },
+    "period2_enabled": {
+      "entity": "switch.charge_and_discharge_period2_enable"
+    },
+    "charge_period2_start": {
+      "entity": "time.charge_start_2"
+    },
+    "charge_period2_end": {
+      "entity": "time.charge_end_2"
+    },
+    "discharge_period2_start": {
+      "entity": "time.discharge_start_2"
+    },
+    "discharge_period2_end": {
+      "entity": "time.discharge_end_2"
+    },
+    "export_limit": {
+      "entity": "number.export_control_user_limit"
+    },
+    "battery_charge_max_current": {
+      "entity": "number.battery_charge_max_current"
+    },
+    "battery_discharge_max_current": {
+      "entity": "number.battery_discharge_max_current"
+    },
+    "battery_charge_max_soc": {
+      "entity": "number.battery_charge_upper_soc"
+    },
+    "offgrid_min_soc": {
+      "entity": "number.eps_min_soc"
+    },
+    "peak_grid_charge": {
+      "entity": "switch.peakshaving_charge_from_grid"
+    },
+    "peak_max_soc": {
+      "entity": "number.peakshaving_max_soc"
+    },
+    "peak_reserved_soc": {
+      "entity": "number.peakshaving_reserved_soc"
+    }
+  }
+}

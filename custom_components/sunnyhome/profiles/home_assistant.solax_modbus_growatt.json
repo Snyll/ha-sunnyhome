@@ -1,0 +1,409 @@
+{
+  "contract": "inverter-settings-v1",
+  "profile": "home_assistant.solax_modbus_growatt",
+  "source": "home_assistant",
+  "vendor": "growatt",
+  "note": "SMB-007 (docs/26-solax-modbus-plugins.md section 12): solax_modbus 2026.10.1 (d644181), read only. entity: <domain>.<key after the hub prefix>, or a list (the first with a state wins); hourMinute: [hour, minute] numbers -> HH:MM; values: option -> catalog code (bool: on/off); scale: multiplies a number. Growatt GEN3 (SPH) and GEN4 (TL-XH, WIT) hybrids; the GEN4 time slots are read from the plugin readback sensors (time_N_*_read), never from its staging selects.",
+  "staleSeconds": 300,
+  "settings": {
+    "battery_min_soc": {
+      "entity": [
+        "number.load_first_battery_minimum_soc",
+        "number.ems_discharging_stop_soc_on_grid"
+      ],
+      "unverified": true
+    },
+    "grid_first_min_soc": {
+      "entity": "number.grid_first_battery_minimum_soc",
+      "unverified": true
+    },
+    "battery_charge_max_soc": {
+      "entity": [
+        "number.battery_first_maximum_soc",
+        "number.ems_charging_stop_soc"
+      ],
+      "unverified": true
+    },
+    "battery_charge_rate": {
+      "entity": [
+        "number.battery_first_charge_rate",
+        "number.ems_charging_rate"
+      ],
+      "unverified": true
+    },
+    "battery_discharge_rate": {
+      "entity": [
+        "number.grid_first_discharge_rate",
+        "number.ems_discharging_rate"
+      ],
+      "unverified": true
+    },
+    "offgrid_min_soc": {
+      "entity": "number.ems_discharging_stop_soc",
+      "unverified": true
+    },
+    "grid_charge": {
+      "entity": [
+        "select.battery_first_charge_from_grid",
+        "select.charger_switch"
+      ],
+      "values": {
+        "Enabled": "on",
+        "Disabled": "off"
+      },
+      "unverified": true
+    },
+    "grid_charge_upper_soc": {
+      "entity": "number.charge_stop_soc_from_grid",
+      "unverified": true
+    },
+    "grid_charge_max_power": {
+      "entity": "number.max_charge_power_from_grid",
+      "scale": 1000,
+      "unverified": true
+    },
+    "export_limit_enabled": {
+      "entity": "select.limit_grid_export",
+      "values": {
+        "Disabled": "off",
+        "Meter 1": "on",
+        "Meter 2": "on",
+        "CT Clamp": "on"
+      },
+      "unverified": true
+    },
+    "export_limit_percent": {
+      "entity": "number.grid_export_limit",
+      "unverified": true
+    },
+    "eps_enabled": {
+      "entity": "select.eps_switch",
+      "values": {
+        "Enabled": "on",
+        "Disabled": "off"
+      },
+      "unverified": true
+    },
+    "charge_period1_enabled": {
+      "entity": "select.battery_first_time_1",
+      "values": {
+        "Enabled": "on",
+        "Disabled": "off"
+      },
+      "unverified": true
+    },
+    "charge_period1_start": {
+      "entity": "time.battery_first_time_1_begin",
+      "unverified": true
+    },
+    "charge_period1_end": {
+      "entity": "time.battery_first_time_1_end",
+      "unverified": true
+    },
+    "discharge_period1_enabled": {
+      "entity": "select.grid_first_time_1",
+      "values": {
+        "Enabled": "on",
+        "Disabled": "off"
+      },
+      "unverified": true
+    },
+    "discharge_period1_start": {
+      "entity": "time.grid_first_time_1_begin",
+      "unverified": true
+    },
+    "discharge_period1_end": {
+      "entity": "time.grid_first_time_1_end",
+      "unverified": true
+    },
+    "charge_period2_enabled": {
+      "entity": "select.battery_first_time_2",
+      "values": {
+        "Enabled": "on",
+        "Disabled": "off"
+      },
+      "unverified": true
+    },
+    "charge_period2_start": {
+      "entity": "time.battery_first_time_2_begin",
+      "unverified": true
+    },
+    "charge_period2_end": {
+      "entity": "time.battery_first_time_2_end",
+      "unverified": true
+    },
+    "discharge_period2_enabled": {
+      "entity": "select.grid_first_time_2",
+      "values": {
+        "Enabled": "on",
+        "Disabled": "off"
+      },
+      "unverified": true
+    },
+    "discharge_period2_start": {
+      "entity": "time.grid_first_time_2_begin",
+      "unverified": true
+    },
+    "discharge_period2_end": {
+      "entity": "time.grid_first_time_2_end",
+      "unverified": true
+    },
+    "charge_period3_enabled": {
+      "entity": "select.battery_first_time_3",
+      "values": {
+        "Enabled": "on",
+        "Disabled": "off"
+      },
+      "unverified": true
+    },
+    "charge_period3_start": {
+      "entity": "time.battery_first_time_3_begin",
+      "unverified": true
+    },
+    "charge_period3_end": {
+      "entity": "time.battery_first_time_3_end",
+      "unverified": true
+    },
+    "discharge_period3_enabled": {
+      "entity": "select.grid_first_time_3",
+      "values": {
+        "Enabled": "on",
+        "Disabled": "off"
+      },
+      "unverified": true
+    },
+    "discharge_period3_start": {
+      "entity": "time.grid_first_time_3_begin",
+      "unverified": true
+    },
+    "discharge_period3_end": {
+      "entity": "time.grid_first_time_3_end",
+      "unverified": true
+    },
+    "time_slot1_enabled": {
+      "entity": "sensor.time_1_enabled_read",
+      "values": {
+        "Enabled": "on",
+        "Disabled": "off"
+      },
+      "unverified": true
+    },
+    "time_slot1_mode": {
+      "entity": "sensor.time_1_mode_read",
+      "values": {
+        "Load First": "load_first",
+        "Battery First": "battery_first",
+        "Grid First": "grid_first"
+      },
+      "unverified": true
+    },
+    "time_slot1_start": {
+      "entity": "sensor.time_1_begin_read",
+      "unverified": true
+    },
+    "time_slot1_end": {
+      "entity": "sensor.time_1_end_read",
+      "unverified": true
+    },
+    "time_slot2_enabled": {
+      "entity": "sensor.time_2_enabled_read",
+      "values": {
+        "Enabled": "on",
+        "Disabled": "off"
+      },
+      "unverified": true
+    },
+    "time_slot2_mode": {
+      "entity": "sensor.time_2_mode_read",
+      "values": {
+        "Load First": "load_first",
+        "Battery First": "battery_first",
+        "Grid First": "grid_first"
+      },
+      "unverified": true
+    },
+    "time_slot2_start": {
+      "entity": "sensor.time_2_begin_read",
+      "unverified": true
+    },
+    "time_slot2_end": {
+      "entity": "sensor.time_2_end_read",
+      "unverified": true
+    },
+    "time_slot3_enabled": {
+      "entity": "sensor.time_3_enabled_read",
+      "values": {
+        "Enabled": "on",
+        "Disabled": "off"
+      },
+      "unverified": true
+    },
+    "time_slot3_mode": {
+      "entity": "sensor.time_3_mode_read",
+      "values": {
+        "Load First": "load_first",
+        "Battery First": "battery_first",
+        "Grid First": "grid_first"
+      },
+      "unverified": true
+    },
+    "time_slot3_start": {
+      "entity": "sensor.time_3_begin_read",
+      "unverified": true
+    },
+    "time_slot3_end": {
+      "entity": "sensor.time_3_end_read",
+      "unverified": true
+    },
+    "time_slot4_enabled": {
+      "entity": "sensor.time_4_enabled_read",
+      "values": {
+        "Enabled": "on",
+        "Disabled": "off"
+      },
+      "unverified": true
+    },
+    "time_slot4_mode": {
+      "entity": "sensor.time_4_mode_read",
+      "values": {
+        "Load First": "load_first",
+        "Battery First": "battery_first",
+        "Grid First": "grid_first"
+      },
+      "unverified": true
+    },
+    "time_slot4_start": {
+      "entity": "sensor.time_4_begin_read",
+      "unverified": true
+    },
+    "time_slot4_end": {
+      "entity": "sensor.time_4_end_read",
+      "unverified": true
+    },
+    "time_slot5_enabled": {
+      "entity": "sensor.time_5_enabled_read",
+      "values": {
+        "Enabled": "on",
+        "Disabled": "off"
+      },
+      "unverified": true
+    },
+    "time_slot5_mode": {
+      "entity": "sensor.time_5_mode_read",
+      "values": {
+        "Load First": "load_first",
+        "Battery First": "battery_first",
+        "Grid First": "grid_first"
+      },
+      "unverified": true
+    },
+    "time_slot5_start": {
+      "entity": "sensor.time_5_begin_read",
+      "unverified": true
+    },
+    "time_slot5_end": {
+      "entity": "sensor.time_5_end_read",
+      "unverified": true
+    },
+    "time_slot6_enabled": {
+      "entity": "sensor.time_6_enabled_read",
+      "values": {
+        "Enabled": "on",
+        "Disabled": "off"
+      },
+      "unverified": true
+    },
+    "time_slot6_mode": {
+      "entity": "sensor.time_6_mode_read",
+      "values": {
+        "Load First": "load_first",
+        "Battery First": "battery_first",
+        "Grid First": "grid_first"
+      },
+      "unverified": true
+    },
+    "time_slot6_start": {
+      "entity": "sensor.time_6_begin_read",
+      "unverified": true
+    },
+    "time_slot6_end": {
+      "entity": "sensor.time_6_end_read",
+      "unverified": true
+    },
+    "time_slot7_enabled": {
+      "entity": "sensor.time_7_enabled_read",
+      "values": {
+        "Enabled": "on",
+        "Disabled": "off"
+      },
+      "unverified": true
+    },
+    "time_slot7_mode": {
+      "entity": "sensor.time_7_mode_read",
+      "values": {
+        "Load First": "load_first",
+        "Battery First": "battery_first",
+        "Grid First": "grid_first"
+      },
+      "unverified": true
+    },
+    "time_slot7_start": {
+      "entity": "sensor.time_7_begin_read",
+      "unverified": true
+    },
+    "time_slot7_end": {
+      "entity": "sensor.time_7_end_read",
+      "unverified": true
+    },
+    "time_slot8_enabled": {
+      "entity": "sensor.time_8_enabled_read",
+      "values": {
+        "Enabled": "on",
+        "Disabled": "off"
+      },
+      "unverified": true
+    },
+    "time_slot8_mode": {
+      "entity": "sensor.time_8_mode_read",
+      "values": {
+        "Load First": "load_first",
+        "Battery First": "battery_first",
+        "Grid First": "grid_first"
+      },
+      "unverified": true
+    },
+    "time_slot8_start": {
+      "entity": "sensor.time_8_begin_read",
+      "unverified": true
+    },
+    "time_slot8_end": {
+      "entity": "sensor.time_8_end_read",
+      "unverified": true
+    },
+    "time_slot9_enabled": {
+      "entity": "sensor.time_9_enabled_read",
+      "values": {
+        "Enabled": "on",
+        "Disabled": "off"
+      },
+      "unverified": true
+    },
+    "time_slot9_mode": {
+      "entity": "sensor.time_9_mode_read",
+      "values": {
+        "Load First": "load_first",
+        "Battery First": "battery_first",
+        "Grid First": "grid_first"
+      },
+      "unverified": true
+    },
+    "time_slot9_start": {
+      "entity": "sensor.time_9_begin_read",
+      "unverified": true
+    },
+    "time_slot9_end": {
+      "entity": "sensor.time_9_end_read",
+      "unverified": true
+    }
+  }
+}

@@ -1,0 +1,200 @@
+{
+  "contract": "inverter-settings-v1",
+  "profile": "home_assistant.solax_modbus_solis",
+  "source": "home_assistant",
+  "vendor": "solis",
+  "note": "SMB-007 (docs/26-solax-modbus-plugins.md section 12): solax_modbus 2026.10.1 (d644181), read only. entity: <domain>.<key after the hub prefix>, or a list (the first with a state wins); hourMinute: [hour, minute] numbers -> HH:MM; values: option -> catalog code (bool: on/off); scale: multiplies a number. Solis hybrids (plugins solis and solis_fb00); the period switches exist on solis_fb00 only.",
+  "staleSeconds": 300,
+  "settings": {
+    "work_mode": {
+      "entity": "select.energy_storage_control_switch",
+      "values": {
+        "Self-Use - No Grid Charging": "self_use",
+        "Timed Charge/Discharge - No Grid Charging": "self_use",
+        "Self-Use - No Timed Charge/Discharge": "self_use",
+        "Self-Use": "self_use",
+        "Battery Awaken": "self_use",
+        "Battery Awaken + Timed Charge/Discharge": "self_use",
+        "Backup/Reserve - No Grid Charging": "backup",
+        "Backup/Reserve - No Timed Charge/Discharge": "backup",
+        "Backup/Reserve": "backup",
+        "Off-Grid Mode": "off_grid",
+        "Feed-in priority - No Grid Charging": "feed_in",
+        "Feed-in priority - No Timed Charge/Discharge": "feed_in",
+        "Feed-in priority": "feed_in"
+      },
+      "unverified": true
+    },
+    "grid_charge": {
+      "entity": "select.energy_storage_control_switch",
+      "values": {
+        "Self-Use - No Grid Charging": "off",
+        "Timed Charge/Discharge - No Grid Charging": "off",
+        "Backup/Reserve - No Grid Charging": "off",
+        "Feed-in priority - No Grid Charging": "off",
+        "Self-Use - No Timed Charge/Discharge": "on",
+        "Self-Use": "on",
+        "Off-Grid Mode": "on",
+        "Battery Awaken": "on",
+        "Battery Awaken + Timed Charge/Discharge": "on",
+        "Backup/Reserve - No Timed Charge/Discharge": "on",
+        "Backup/Reserve": "on",
+        "Feed-in priority - No Timed Charge/Discharge": "on",
+        "Feed-in priority": "on"
+      },
+      "unverified": true
+    },
+    "battery_min_soc": {
+      "entity": "number.battery_minimum_soc",
+      "unverified": true
+    },
+    "backup_min_soc": {
+      "entity": "number.backup_mode_soc",
+      "unverified": true
+    },
+    "force_charge_soc": {
+      "entity": "number.force_charge_soc",
+      "unverified": true
+    },
+    "battery_charge_max_current": {
+      "entity": "number.battery_charge_current",
+      "unverified": true
+    },
+    "battery_discharge_max_current": {
+      "entity": "number.battery_discharge_current",
+      "unverified": true
+    },
+    "export_limit_enabled": {
+      "entity": "select.backflow_power_switch",
+      "values": {
+        "Off": "off",
+        "On": "on",
+        "Off & Balanced output": "off",
+        "On & Balanced output": "on",
+        "Off & Unbalanced output": "off",
+        "On & Unbalanced output": "on"
+      },
+      "unverified": true
+    },
+    "export_limit": {
+      "entity": "number.backflow_power",
+      "unverified": true
+    },
+    "timed_charge_current": {
+      "entity": "number.timed_charge_current",
+      "unverified": true
+    },
+    "timed_discharge_current": {
+      "entity": "number.timed_discharge_current",
+      "unverified": true
+    },
+    "charge_period1_enabled": {
+      "entity": "switch.timed_charge_slot_1_enable",
+      "unverified": true
+    },
+    "charge_period1_start": {
+      "hourMinute": [
+        "number.timed_charge_start_hours",
+        "number.timed_charge_start_minutes"
+      ],
+      "unverified": true
+    },
+    "charge_period1_end": {
+      "hourMinute": [
+        "number.timed_charge_end_hours",
+        "number.timed_charge_end_minutes"
+      ],
+      "unverified": true
+    },
+    "discharge_period1_enabled": {
+      "entity": "switch.timed_discharge_slot_1_enable",
+      "unverified": true
+    },
+    "discharge_period1_start": {
+      "hourMinute": [
+        "number.timed_discharge_start_hours",
+        "number.timed_discharge_start_minutes"
+      ],
+      "unverified": true
+    },
+    "discharge_period1_end": {
+      "hourMinute": [
+        "number.timed_discharge_end_hours",
+        "number.timed_discharge_end_minutes"
+      ],
+      "unverified": true
+    },
+    "charge_period2_enabled": {
+      "entity": "switch.timed_charge_slot_2_enable",
+      "unverified": true
+    },
+    "charge_period2_start": {
+      "hourMinute": [
+        "number.timed_charge_start_hours_2",
+        "number.timed_charge_start_minutes_2"
+      ],
+      "unverified": true
+    },
+    "charge_period2_end": {
+      "hourMinute": [
+        "number.timed_charge_end_hours_2",
+        "number.timed_charge_end_minutes_2"
+      ],
+      "unverified": true
+    },
+    "discharge_period2_enabled": {
+      "entity": "switch.timed_discharge_slot_2_enable",
+      "unverified": true
+    },
+    "discharge_period2_start": {
+      "hourMinute": [
+        "number.timed_discharge_start_hours_2",
+        "number.timed_discharge_start_minutes_2"
+      ],
+      "unverified": true
+    },
+    "discharge_period2_end": {
+      "hourMinute": [
+        "number.timed_discharge_end_hours_2",
+        "number.timed_discharge_end_minutes_2"
+      ],
+      "unverified": true
+    },
+    "charge_period3_enabled": {
+      "entity": "switch.timed_charge_slot_3_enable",
+      "unverified": true
+    },
+    "charge_period3_start": {
+      "hourMinute": [
+        "number.timed_charge_start_hours_3",
+        "number.timed_charge_start_minutes_3"
+      ],
+      "unverified": true
+    },
+    "charge_period3_end": {
+      "hourMinute": [
+        "number.timed_charge_end_hours_3",
+        "number.timed_charge_end_minutes_3"
+      ],
+      "unverified": true
+    },
+    "discharge_period3_enabled": {
+      "entity": "switch.timed_discharge_slot_3_enable",
+      "unverified": true
+    },
+    "discharge_period3_start": {
+      "hourMinute": [
+        "number.timed_discharge_start_hours_3",
+        "number.timed_discharge_start_minutes_3"
+      ],
+      "unverified": true
+    },
+    "discharge_period3_end": {
+      "hourMinute": [
+        "number.timed_discharge_end_hours_3",
+        "number.timed_discharge_end_minutes_3"
+      ],
+      "unverified": true
+    }
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "contract": "inverter-settings-v1",
+  "profile": "home_assistant.solax_modbus_sofar",
+  "source": "home_assistant",
+  "vendor": "sofar",
+  "note": "SMB-007 (docs/26-solax-modbus-plugins.md section 12): solax_modbus 2026.10.1 (d644181), read only. entity: <domain>.<key after the hub prefix>, or a list (the first with a state wins); hourMinute: [hour, minute] numbers -> HH:MM; values: option -> catalog code (bool: on/off); scale: multiplies a number. Sofar HYD hybrids (plugin sofar).",
+  "staleSeconds": 300,
+  "settings": {
+    "work_mode": {
+      "entity": "select.charger_use_mode",
+      "values": {
+        "Self Use": "self_use",
+        "Time of Use": "tou",
+        "Timing Mode": "timing",
+        "Passive Mode": "passive",
+        "Peak Cut Mode": "peak_shaving",
+        "Off-grid Mode": "off_grid",
+        "Feed-In Priority Mode": "feed_in"
+      },
+      "unverified": true
+    },
+    "export_limit_enabled": {
+      "entity": "select.feedin_limitation_mode",
+      "values": {
+        "Disabled": "off",
+        "Enabled - Feed-in limitation": "on",
+        "Enabled - 3-phase limit": "on"
+      },
+      "unverified": true
+    },
+    "export_limit": {
+      "entity": "number.feedin_max_power",
+      "unverified": true
+    },
+    "eps_enabled": {
+      "entity": "select.eps_control",
+      "values": {
+        "Turn Off": "off",
+        "Turn On, Prohibit Cold Start": "on",
+        "Turn On, Enable Cold Start": "on"
+      },
+      "unverified": true
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "domain": "sunnyhome",
+  "name": "SunnyHome",
+  "codeowners": ["@Snyll"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/Snyll/ha-sunnyhome",
+  "integration_type": "service",
+  "iot_class": "cloud_push",
+  "issue_tracker": "https://github.com/Snyll/ha-sunnyhome/issues",
+  "requirements": [],
+  "version": "0.10.0"
+}
