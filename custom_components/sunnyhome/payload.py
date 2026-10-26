@@ -329,6 +329,7 @@ def build(
     hub_settings: dict | None = None,
     integration: str = "solax_modbus",
     hub_info: dict | None = None,
+    wallbox: dict | None = None,
 ) -> dict:
     """Body of POST /api/ha/v1/states.
 
@@ -341,6 +342,7 @@ def build(
     remote is the inverter's remote state (BAT-008), given whenever the hub has the mode sensor (BAT-003C).
     hub_settings is the hub's settings object (ISET-004, see settings()), sent beside the readings.
     hub_info is the hub's plugin and manufacturer (HA-008, see hub()), sent beside the readings of a solax_modbus hub.
+    wallbox is the EV-charger hub's envelope (EV-004, see wallbox_report()), sent beside either inverter key.
     """
     solax = None if readings is None else {
         "serial": serial,
@@ -362,6 +364,8 @@ def build(
         body = {"sentAt": _iso(sent_at), "solax": solax, "entities": items[:MAX_ENTITIES]}
     if sensors is not None:  # expand -> contract: only while sensors are ticked (a backend before HA-005 refuses the key)
         body["sensors"] = _sensors(sensors)
+    if wallbox is not None:  # EV-004: only with an EV-charger hub (a backend before EV-004 refuses a solax_modbus wallbox)
+        body["wallbox"] = wallbox
     return body
 
 
@@ -855,3 +859,282 @@ class Inverter:
             elif remote and (self.exit_sent is None or self.clock() >= self.exit_sent + EXIT_RETRY_S):
                 self.exit_sent = self.clock()
                 await self._call("select", "select_option", {"entity_id": remote.mode, "option": SELECT_DISABLED})
+
+
+# EV-004 (0.11.0, docs/reviews/EV-004.md §1, §2, §5 as amended by the pre review): the solax_modbus EV-charger hub (plugin
+# solax_ev_charger). Its readings are posted as "wallbox" beside the inverter; with the Wallbox control option on SunnyHome may set its
+# work mode (select charger_use_mode) under a stored lease that returns it to the wallbox's normal mode when SunnyHome stops renewing.
+# Option texts pinned to plugin_solax_ev_charger.py at solax_modbus 2026.09.4. The session commands (control_command) are never used.
+WALLBOX_KEYS = frozenset({
+    "charge_power", "charge_power_l1", "charge_power_l2", "charge_power_l3", "charge_current_l1", "charge_current_l2", "charge_current_l3",
+    "charge_voltage_l1", "charge_voltage_l2", "charge_voltage_l3", "charge_added", "charge_added_total",
+})
+WALLBOX_MODE_KEY = "charger_use_mode"
+MAX_WALLBOX_READINGS = 16  # the server's bound
+WALLBOX_OPTIONS = {"stop": "Stop", "fast": "Fast", "eco": "ECO", "green": "Green"}  # SunnyHome's mode -> the select's option
+_WALLBOX_MODES = {option: mode for mode, option in WALLBOX_OPTIONS.items()}
+GEAR_6A = "6A"  # GREEN and ECO always at their 6 A gear (EV-001 c.6: GREEN never at 3 A)
+WALLBOX_SCAN_MAX_S = 30  # pre review P2-5: a slower hub scan reports the control off (the confirm window would end before a poll)
+WALLBOX_CONFIRM_MARGIN_S = 10
+WALLBOX_CALL_S = 20  # a select call still running after this counts as failed (unknown once armed)
+_WALLBOX_COMMAND_KEYS = frozenset({"id", "wallbox", "mode", "normal", "durationS", "renew", "held", "ttlMs"})
+
+
+def ev_plugin(plugin: str | None) -> bool:
+    """EV-004: an EV-charger hub of solax_modbus (plugin solax_ev_charger); it is never an inverter."""
+    return isinstance(plugin, str) and plugin.startswith("solax_ev")
+
+
+def wallbox_mode(state: str | None) -> str | None:
+    """The SunnyHome mode a charger_use_mode option shows (None: unknown, unavailable or another text)."""
+    return _WALLBOX_MODES.get(state) if isinstance(state, str) else None
+
+
+def wallbox_report(serial: str | None, readings: list, control: dict) -> dict:
+    """The /states "wallbox" envelope of the EV-charger hub: (key, unit, state, last_reported) readings, at most the server's 16."""
+    return {
+        "integration": "solax_modbus", "serial": serial,
+        "readings": [{"key": key, "unit": unit, "state": str(state), "lastReported": _iso(reported)}
+                     for key, unit, state, reported in readings[:MAX_WALLBOX_READINGS]],
+        "control": control,
+    }
+
+
+def wallbox_control(enabled: bool, reason: str | None, plugin: object, model: object, firmware: object) -> dict:
+    """The envelope's "control": the Wallbox control option on with the three selects and a fast enough scan, why not, and the
+    verified-key inputs (null without control)."""
+    return {
+        "enabled": enabled, "reason": None if enabled else reason,
+        "plugin": _key_part(plugin) if enabled else None, "model": _key_part(model) if enabled else None,
+        "firmware": _key_part(firmware) if enabled else None,
+    }
+
+
+class Charger(NamedTuple):
+    """The resolved entities of the single EV-charger hub and its scan interval (seconds)."""
+
+    mode: str  # select charger_use_mode (0x60D)
+    green_gear: str  # select green_gear (0x60F)
+    eco_gear: str  # select eco_gear (0x60E)
+    scan_s: float = 15
+
+
+class WallboxCommand(NamedTuple):
+    id: str
+    op: str  # apply or exit
+    mode: str  # stop, fast, eco or green (an exit: the normal mode, stop or green)
+    normal: str | None  # apply: the normal mode the lease returns to
+    duration_s: int | None  # apply: 120-1800
+    renew: bool | None  # apply: only extend the live lease of this mode (pre review P1-2)
+    held: str | None  # exit: the mode SunnyHome last applied (pre review P2-1)
+    ttl_ms: int
+
+
+def parse_wallbox(item: object) -> tuple[str | None, WallboxCommand | None]:
+    """Strict check of one claimed wallbox command; the optional keys may be absent or null."""
+    if not isinstance(item, dict) or not isinstance(cid := item.get("id"), str) or not _UUID.fullmatch(cid):
+        return None, None
+    op, mode, normal, duration, renew, held, ttl = (item.get(key) for key in ("wallbox", "mode", "normal", "durationS", "renew", "held", "ttlMs"))
+    valid = (
+        item.keys() <= _WALLBOX_COMMAND_KEYS and type(ttl) is int and ttl >= 0 and mode in WALLBOX_OPTIONS
+        and (
+            (op == "apply" and normal in ("stop", "green") and type(duration) is int and 120 <= duration <= 1800 and type(renew) is bool
+             and held is None)
+            or (op == "exit" and mode in ("stop", "green") and normal is None and duration is None and renew is None
+                and (held is None or held in WALLBOX_OPTIONS))
+        )
+    )
+    return cid, (WallboxCommand(cid, op, mode, normal, duration, renew, held, ttl) if valid else None)
+
+
+class WallboxLease(NamedTuple):
+    """The armed mode: the apply that armed it, its end (UTC seconds), the target, the normal mode, the previous lease's target, the settle end."""
+
+    command: str
+    until: float
+    target: str
+    normal: str
+    prev: str | None
+    settle: float
+    reason: str | None = None  # option_off: ended early because the option was turned off
+
+
+class Wallbox:
+    """EV-004: the EV charger's work mode under an HA-enforced lease. Pure: Home Assistant is reached through the callbacks.
+
+    state(entity_id) gives (state text, last_reported as UTC seconds) or None. "failed" only before the lease is armed (nothing written);
+    once armed every failure is "unknown"; "done" only when a real poll (the select's last_reported past the write's own echo) still
+    shows every written option. The lease is the only end of a mode: the tick writes the normal mode at its end unless it was renewed.
+    """
+
+    def __init__(self, lock: asyncio.Lock, charger: Callable[[], Charger | None], enabled: Callable[[], bool],
+                 state: Callable[[str], tuple[str | None, float | None] | None], dispatch: Callable[[str, str, dict], asyncio.Future],
+                 save: Callable[[dict | None], Awaitable], echoes: dict, clock: Callable[[], float] = time.monotonic,
+                 wall: Callable[[], float] = time.time, sleep: Callable[[float], Awaitable] = asyncio.sleep) -> None:
+        self.lock, self.charger, self.enabled, self.state, self.dispatch = lock, charger, enabled, state, dispatch
+        self._save, self.echoes, self.clock, self.wall, self.sleep = save, echoes, clock, wall, sleep
+        self.lease: WallboxLease | None = None
+        self.exit_sent: float | None = None  # monotonic time of the last unconfirmed lease-end write
+        self.ticking = False
+        self.unloaded = False
+
+    def load(self, data: object) -> None:
+        """The stored lease; one that ended while HA was down is ended by the first tick once the select is known (pre review P2-2)."""
+        try:
+            lease = WallboxLease(str(data["command"]), float(data["until"]), str(data["target"]), str(data["normal"]),
+                                 None if data.get("prev") is None else str(data["prev"]), float(data["settle"]),
+                                 None if data.get("reason") is None else str(data["reason"]))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return  # none, or damaged: never guessed (an exit's held mode still ends it, P2-1)
+        if lease.target in WALLBOX_OPTIONS and lease.normal in ("stop", "green"):
+            self.lease = lease
+
+    async def save(self) -> None:
+        await self._save(None if self.lease is None else self.lease._asdict())
+
+    async def _drop(self) -> None:
+        self.lease, self.exit_sent = None, None
+        await self.save()
+
+    def _shown(self, entity_id: str) -> tuple[str | None, float | None]:
+        seen = self.state(entity_id)
+        return seen if seen is not None else (None, None)
+
+    def _gear(self, target: str, charger: Charger) -> str | None:
+        return charger.green_gear if target == "green" else charger.eco_gear if target == "eco" else None
+
+    async def execute(self, cmd: WallboxCommand, sent: float) -> tuple[str, str | None]:
+        """Run one claimed command; (outcome, reason). The lock is the first await, so commands keep claim order."""
+        until = deadline(sent, cmd.ttl_ms)
+        async with self.lock:
+            if cmd.op == "exit" and self.lease is not None and self.lease.until > self.wall():
+                self.lease = self.lease._replace(until=self.wall())  # the exit ends the lease whatever happens next (before the ttl check)
+                await self.save()
+            if cmd.op == "apply" and not self.enabled():
+                return "failed", "wallbox_control_off"
+            if (charger := self.charger()) is None:
+                return "failed", "entities_missing"
+            shown = wallbox_mode(self._shown(charger.mode)[0])
+            gear = self._gear(cmd.mode, charger)
+            if shown is None or gear is not None and self._shown(gear)[0] in (None, "unavailable", "unknown"):
+                return "failed", "entity_unavailable"
+            if self.clock() >= until:
+                return "failed", "expired_on_arrival"
+            if cmd.op == "exit":
+                return await self._exit(cmd, charger, shown)
+            if cmd.renew:
+                return await self._renew(cmd, sent, charger, shown)
+            return await self._apply(cmd, sent, charger)
+
+    async def _renew(self, cmd: WallboxCommand, sent: float, charger: Charger, shown: str) -> tuple[str, str | None]:
+        """P1-2: only a live lease of this mode, still shown, with its 6 A gear (P3-1), is extended; never a write."""
+        lease, gear = self.lease, self._gear(cmd.mode, charger)
+        if lease is None or lease.target != cmd.mode or lease.until <= self.wall() or shown != cmd.mode \
+                or gear is not None and self._shown(gear)[0] != GEAR_6A:
+            return "failed", "outside_change"
+        self.lease = lease._replace(until=self.wall() - (self.clock() - sent) + cmd.duration_s, normal=cmd.normal, reason=None)
+        await self.save()
+        return "done", None
+
+    async def _apply(self, cmd: WallboxCommand, sent: float, charger: Charger) -> tuple[str, str | None]:
+        elapsed, now = self.clock() - sent, self.wall()
+        self.lease = WallboxLease(cmd.id, now - elapsed + cmd.duration_s, cmd.mode, cmd.normal, self.lease and self.lease.target,
+                                  now + SETTLE_S)
+        self.exit_sent = None
+        await self.save()  # armed before the first write: a crash right after it never leaves a mode without its lease
+        return await self._write(charger, cmd.mode)
+
+    async def _exit(self, cmd: WallboxCommand, charger: Charger, shown: str) -> tuple[str, str | None]:
+        lease = self.lease
+        if lease is not None:
+            if shown not in (lease.target, lease.prev):  # already normal, or a hand change: never overwritten
+                await self._drop()
+                return "done", None
+            result = await self._write(charger, cmd.mode)
+            if result[0] == "done":
+                await self._drop()
+            return result
+        if cmd.held is not None and shown == cmd.held and shown != cmd.mode:  # P2-1: a lease lost to damaged storage still exits
+            return await self._write(charger, cmd.mode)
+        return "done", None  # the charger is not in what SunnyHome set: nothing to end
+
+    async def _write(self, charger: Charger, mode: str) -> tuple[str, str | None]:
+        """P2-5: the gear (GREEN/ECO at 6 A), then the mode, then one confirm window for all; P1-1: done only after a real poll."""
+        writes = []
+        if (gear := self._gear(mode, charger)) is not None and self._shown(gear)[0] != GEAR_6A:
+            writes.append((gear, GEAR_6A))
+        writes.append((charger.mode, WALLBOX_OPTIONS[mode]))
+        for entity_id, option in writes:
+            if not await self._call(entity_id, option):
+                return "unknown", "service_error"
+        echo = self._shown(charger.mode)[1]
+        self.echoes[charger.mode] = echo  # the reading is withheld from posts until a real poll (P1-1)
+        end = self.clock() + min(charger.scan_s + WALLBOX_CONFIRM_MARGIN_S, WALLBOX_SCAN_MAX_S + WALLBOX_CONFIRM_MARGIN_S)
+        while True:
+            state, reported = self._shown(charger.mode)
+            if reported is not None and (echo is None or reported > echo):
+                ok = all(self._shown(entity_id)[0] == option for entity_id, option in writes)
+                return ("done", None) if ok else ("unknown", "not_applied")
+            if self.clock() >= end:
+                return "unknown", "no_confirmation"
+            await self.sleep(POLL_S)
+
+    async def _call(self, entity_id: str, option: str) -> bool:
+        """One select_option, awaited; False when it was refused (also synchronously), failed or ran too long."""
+        try:
+            task = self.dispatch("select", "select_option", {"entity_id": entity_id, "option": option})
+        except Exception as err:  # noqa: BLE001 - armed: any refusal ends the sequence as unknown
+            _LOGGER.debug("Wallbox call refused: %s", type(err).__name__)
+            return False
+        if self.lease is not None:
+            self.lease = self.lease._replace(settle=self.wall() + SETTLE_S)
+        end = self.clock() + WALLBOX_CALL_S
+        while not task.done():
+            if self.clock() >= end:
+                return False
+            await self.sleep(POLL_S)
+        return not task.cancelled() and task.exception() is None
+
+    async def tick(self, _now: object = None) -> None:
+        """Every 5 s while a lease is stored: a hand change drops it (no write), its end writes the normal mode until a real poll shows it."""
+        if self.lease is None or self.ticking:
+            return
+        self.ticking = True
+        try:
+            await self._tick()
+        finally:
+            self.ticking = False
+
+    async def _tick(self) -> None:
+        async with self.lock:
+            if self.unloaded:
+                return
+            lease, now = self.lease, self.wall()
+            if lease is None:
+                return
+            charger = self.charger()
+            state, reported = self._shown(charger.mode) if charger else (None, None)
+            shown = wallbox_mode(state)
+            if shown is None:
+                return  # P2-2: HA starting (the select is unknown until its first poll) or the entities gone: neither drop nor write
+            if not self.enabled() and lease.reason != "option_off":
+                lease = self.lease = lease._replace(until=min(lease.until, now), reason="option_off")
+                await self.save()
+            echo = self.echoes.get(charger.mode)
+            polled = echo is None or (reported is not None and reported > echo)
+            if shown not in (lease.target, lease.prev, lease.normal):
+                await self._drop()  # someone else changed it: left as it is
+            elif lease.until > now:
+                if now >= lease.settle and shown == lease.normal != lease.target and polled:
+                    await self._drop()  # P1-2: a hand change to the normal mode mid-lease
+            elif shown == lease.normal and polled:
+                await self._drop()  # ended: the normal mode, seen by a real poll
+            elif now > lease.until + EXIT_GIVE_UP_S:
+                await self._drop()
+            elif shown != lease.normal and (self.exit_sent is None or self.clock() >= self.exit_sent + EXIT_RETRY_S):
+                self.exit_sent = self.clock()
+                gear = self._gear(lease.normal, charger)
+                if gear is not None and self._shown(gear)[0] != GEAR_6A:
+                    await self._call(gear, GEAR_6A)
+                if await self._call(charger.mode, WALLBOX_OPTIONS[lease.normal]):
+                    self.echoes[charger.mode] = self._shown(charger.mode)[1]

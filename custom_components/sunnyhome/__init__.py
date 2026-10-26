@@ -26,6 +26,10 @@ DEYE-003 (0.10.0): the single inverter entry may instead be a Deye inverter of t
 an entry whose inverter device's manufacturer starts with "Deye"; Home Assistant core's Solarman plugs and meters never count). Its
 sensors (payload.DEYE_KEYS) are posted as "inverter" once the Device sensor's Serial Number attribute holds a valid serial (never the
 registry serial, which falls back to the logger's); its entities are never shared. Read only: no solarman service is ever called.
+EV-004 (0.11.0): a solax_modbus hub of the EV-charger plugin (solax_ev_charger) is never an inverter entry, so it sits beside the
+inverter hub. Its readings and work mode are posted as "wallbox"; with the separate Wallbox control option on SunnyHome may set its
+work mode (charger_use_mode, GREEN and ECO at their 6 A gear) under a stored lease that returns it to the wallbox's normal mode when
+SunnyHome stops renewing (payload.Wallbox). If Home Assistant itself is down the charger keeps the mode. One EV-charger hub only.
 """
 
 from __future__ import annotations
@@ -54,7 +58,7 @@ from homeassistant.helpers.event import async_track_state_change_event, async_tr
 from homeassistant.util import dt as dt_util
 
 from . import payload
-from .const import CONF_CONTROL, CONF_ENTITIES, CONF_INVERTER, CONF_SENSORS, DOMAIN, VERSION
+from .const import CONF_CONTROL, CONF_ENTITIES, CONF_INVERTER, CONF_SENSORS, CONF_WALLBOX, DOMAIN, VERSION
 
 _LOGGER = logging.getLogger(__name__)
 SOLAX = "solax_modbus"
@@ -74,12 +78,50 @@ REMOTE_KEYS = {
     "mode": ("select", "modbus_power_control_direct"), "power": ("number", "remotecontrol_push_mode_power_direct"),
     "timeout": ("number", "remotecontrol_timeout_direct"), "sensor": ("sensor", "modbus_power_control"),
 }
+# EV-004: the EV-charger hub's selects, by role (unique id key after "<hub name>_").
+CHARGER_KEYS = {"mode": "charger_use_mode", "green_gear": "green_gear", "eco_gear": "eco_gear"}
+CHARGER_LOCK = "solax_modbus:ev"  # its own hub lock: inverter and charger commands never wait for each other
+_warned_chargers = False
 
 
 def inverter_entries(hass: HomeAssistant) -> list[tuple[str, ConfigEntry]]:
-    """GW-002: the (domain, entry) of every inverter integration entry (solax_modbus, goodwe; DEYE-003: Deye solarman entries)."""
-    found = [(domain, entry) for domain in INVERTERS for entry in hass.config_entries.async_entries(domain)]
+    """GW-002: the (domain, entry) of every inverter integration entry (solax_modbus, goodwe; DEYE-003: Deye solarman entries).
+    EV-004: a solax_modbus EV-charger hub is not one."""
+    found = [(domain, entry) for domain in INVERTERS for entry in hass.config_entries.async_entries(domain)
+             if not (domain == SOLAX and payload.ev_plugin(hub_plugin(entry)))]
     return found + [(SOLARMAN, entry) for entry in deye_entries(hass)]
+
+
+def charger_hub(hass: HomeAssistant) -> ConfigEntry | None:
+    """EV-004: the single solax_modbus EV-charger hub, or None (none, or several: logged once, nothing sent or controlled)."""
+    global _warned_chargers
+    hubs = [entry for entry in hass.config_entries.async_entries(SOLAX) if payload.ev_plugin(hub_plugin(entry))]
+    if len(hubs) > 1 and not _warned_chargers:
+        _warned_chargers = True
+        _LOGGER.warning("Several EV charger hubs: SunnyHome reads and controls one EV charger only, so it reads none")
+    return hubs[0] if len(hubs) == 1 else None
+
+
+def charger_scan(hub: ConfigEntry) -> float:
+    """The EV-charger hub's scan interval in seconds (solax_modbus' default 15 s; its selects are in the default group)."""
+    try:
+        return float(hub.options.get("scan_interval") or hub.data.get("scan_interval") or 15)
+    except (TypeError, ValueError):
+        return 15.0
+
+
+def solax_charger(hass: HomeAssistant) -> payload.Charger | None:
+    """EV-004: the three selects of the single EV-charger hub resolved by unique id; None unless all are there."""
+    hub = charger_hub(hass)
+    if hub is None:
+        return None
+    prefix = f"{hub.options.get('name') or hub.data.get('name')}_"
+    wanted = {("select", prefix + key): role for role, key in CHARGER_KEYS.items()}
+    found = {}
+    for ent in er.async_entries_for_config_entry(er.async_get(hass), hub.entry_id):
+        if ent.platform == SOLAX and not ent.disabled and (role := wanted.get((ent.domain, ent.unique_id))):
+            found[role] = ent.entity_id
+    return payload.Charger(**found, scan_s=charger_scan(hub)) if len(found) == len(CHARGER_KEYS) else None
 
 
 def deye_entries(hass: HomeAssistant) -> list[ConfigEntry]:
@@ -140,7 +182,7 @@ def hub_plugin(hub: ConfigEntry) -> str | None:
 def solax_entities(hass: HomeAssistant) -> tuple[dict[str, str], str | None]:
     """BAT-008: the direct VPP entities of the single solax_modbus hub found by role (resolved by unique id), and the inverter device.
     SMB-004: none for a hub of another brand's plugin (no control of Growatt, Solis or Sofar)."""
-    hubs = hass.config_entries.async_entries(SOLAX)
+    hubs = [entry for entry in hass.config_entries.async_entries(SOLAX) if not payload.ev_plugin(hub_plugin(entry))]  # EV-004
     # GW-002: only while it is the single inverter entry; DEYE-003: a Deye entry is another inverter (a core Solarman plug is not)
     if len(hubs) != 1 or hass.config_entries.async_entries(GOODWE) or deye_entries(hass):
         return {}, None
@@ -170,7 +212,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # AUTO-004: the leases are kept with or without a control list (an empty list drops them) and whatever the token's state,
     # so a lease still ends its device after an unlink.
     await runner.start_leases()
-    if entry.options.get(CONF_CONTROL) or entry.options.get(CONF_INVERTER):  # BAT-008: the inverter option alone also claims
+    # BAT-008: the inverter option alone also claims; EV-004: so does the Wallbox control option
+    if entry.options.get(CONF_CONTROL) or entry.options.get(CONF_INVERTER) or entry.options.get(CONF_WALLBOX):
         # An entry background task: HA cancels it, and the commands it started, on unload or reload.
         entry.async_create_background_task(hass, runner.run(), "SunnyHome commands")
     return True
@@ -198,6 +241,19 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
             )
         except Exception as err:  # noqa: BLE001 - best effort; the inverter's own timeout is the backstop
             _LOGGER.debug("Inverter exit at removal failed: %s", type(err).__name__)
+    await store.async_remove()
+    # EV-004: a stored wallbox lease gets a best-effort write of its normal mode first, only while the charger still shows what the lease
+    # set (post review P3-4: never over a hand change)
+    store = storage.Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.wallbox")
+    if (data := await store.async_load()) and (charger := solax_charger(hass)) and data.get("normal") in payload.WALLBOX_OPTIONS \
+            and (state := hass.states.get(charger.mode)) is not None \
+            and payload.wallbox_mode(state.state) in (data.get("target"), data.get("prev")):
+        try:
+            await hass.services.async_call(
+                "select", "select_option", {"entity_id": charger.mode, "option": payload.WALLBOX_OPTIONS[data["normal"]]}, blocking=True
+            )
+        except Exception as err:  # noqa: BLE001 - best effort
+            _LOGGER.debug("Wallbox exit at removal failed: %s", type(err).__name__)
     await store.async_remove()
 
 
@@ -245,8 +301,40 @@ class Pusher:
         solax = solax and payload.solax_plugin(info["plugin"])
         return payload.build(
             dt_util.utcnow(), serial, readings, self.entities(), controllable(self.hass, self.entry), self.sensors(),
-            self.remote(readings) if solax else None, self.settings(hub, profile) if profile else None, domain, info,
+            self.remote(readings) if solax else None, self.settings(hub, profile) if profile else None, domain, info, self.wallbox(),
         )
+
+    def wallbox(self) -> dict | None:
+        """EV-004: the EV-charger hub's envelope (readings, the work mode select, the control report), or None without one hub.
+        Pre review P1-1: the work mode is left out while the select still shows SunnyHome's own write (no real poll since)."""
+        hub = charger_hub(self.hass)
+        if hub is None:
+            return None
+        prefix = f"{hub.options.get('name') or hub.data.get('name')}_"
+        device = inverter_device(self.hass, hub)
+        echoes = self.hass.data.setdefault(DOMAIN, {}).setdefault("echoes", {})
+        readings = []
+        for ent in er.async_entries_for_config_entry(er.async_get(self.hass), hub.entry_id):
+            if ent.platform != SOLAX or ent.disabled or not ent.unique_id.startswith(prefix):
+                continue
+            key = ent.unique_id[len(prefix):]
+            wanted = ent.domain == "sensor" and key in payload.WALLBOX_KEYS or ent.domain == "select" and key == payload.WALLBOX_MODE_KEY
+            if not wanted or (state := self.hass.states.get(ent.entity_id)) is None:
+                continue
+            if ent.domain == "select" and (echo := echoes.get(ent.entity_id)) is not None and state.last_reported is not None \
+                    and state.last_reported.timestamp() <= echo:
+                continue
+            readings.append((key, state.attributes.get("unit_of_measurement"), state.state, state.last_reported))
+        charger = solax_charger(self.hass)
+        option = bool(self.entry.options.get(CONF_WALLBOX))
+        reason = "option_off" if not option else "entities_missing" if charger is None else "scan_interval" \
+            if charger.scan_s > payload.WALLBOX_SCAN_MAX_S else None
+        try:
+            plugin = loader.async_get_loaded_integration(self.hass, SOLAX).version if reason is None else None
+        except Exception:  # noqa: BLE001 - not loaded: no plugin version, so never verified
+            plugin = None
+        control = payload.wallbox_control(reason is None, reason, plugin, device.model if device else None, device.sw_version if device else None)
+        return payload.wallbox_report(device.serial_number if device else None, readings, control)
 
     def settings(self, hub: ConfigEntry, profile: str = SOLAX) -> dict | None:
         """ISET-004: the states of the hub's entities its integration's profile names, as "<domain>.<unique id key>"; read only.
@@ -446,6 +534,13 @@ class CommandRunner:
             lambda: bool(entry.options.get(CONF_INVERTER)), self.raw_state, self.dispatch, self.save_inverter,
             lambda command, outcome, reason: self.report(command, outcome, reason, None),
         )
+        # EV-004: the wallbox lease has its own store and lock; the echoes (the select's last_reported of SunnyHome's own write) are shared
+        # with the pusher, which withholds the work mode until a real poll.
+        self.wallbox_store = storage.Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.wallbox")
+        self.wallbox = payload.Wallbox(
+            shared["locks"].setdefault(CHARGER_LOCK, asyncio.Lock()), lambda: solax_charger(hass),
+            lambda: bool(entry.options.get(CONF_WALLBOX)), self.select_state, self.dispatch, self.save_wallbox, shared.setdefault("echoes", {}),
+        )
         self.env = payload.Env(
             shared["locks"], shared.setdefault("inflight", {}),
             lambda entity_id: entity_id in controllable(hass, entry), self.seen, self.dispatch,
@@ -467,12 +562,30 @@ class CommandRunner:
         self.entry.async_on_unload(async_track_time_interval(
             self.hass, self.inverter.tick, timedelta(seconds=LEASE_TICK_S), name="SunnyHome inverter lease"
         ))
+        # EV-004: the wallbox lease survives unload, reload and restart; the tick also ends it when the option was turned off.
+        self.wallbox.load(await self.wallbox_store.async_load())
+        self.entry.async_on_unload(lambda: setattr(self.wallbox, "unloaded", True))
+        self.entry.async_on_unload(async_track_time_interval(
+            self.hass, self.wallbox.tick, timedelta(seconds=LEASE_TICK_S), name="SunnyHome wallbox lease"
+        ))
 
     async def save_inverter(self, data: dict | None) -> None:
         if data is None:
             await self.inverter_store.async_remove()
         else:
             await self.inverter_store.async_save(data)
+
+    async def save_wallbox(self, data: dict | None) -> None:
+        if data is None:
+            await self.wallbox_store.async_remove()
+        else:
+            await self.wallbox_store.async_save(data)
+
+    def select_state(self, entity_id: str) -> tuple[str | None, float | None] | None:
+        """EV-004: a select's state and its last_reported (UTC seconds), or None."""
+        if (state := self.hass.states.get(entity_id)) is None:
+            return None
+        return state.state, state.last_reported.timestamp() if state.last_reported else None
 
     def raw_state(self, entity_id: str) -> str | None:
         return state.state if (state := self.hass.states.get(entity_id)) is not None else None
@@ -581,11 +694,12 @@ class CommandRunner:
                 delay = 0
                 for item in commands:
                     inverter = isinstance(item, dict) and "inverter" in item  # BAT-008
-                    cid, cmd = (payload.parse_inverter if inverter else payload.parse_command)(item)
+                    wallbox = isinstance(item, dict) and "wallbox" in item  # EV-004
+                    parse = payload.parse_wallbox if wallbox else payload.parse_inverter if inverter else payload.parse_command
+                    run = self.execute_wallbox if wallbox else self.execute_inverter if inverter else self.execute
+                    cid, cmd = parse(item)
                     if cid is not None:  # an invalid command without a valid id is dropped
-                        self.entry.async_create_background_task(
-                            self.hass, (self.execute_inverter if inverter else self.execute)(cid, cmd, sent), "SunnyHome command"
-                        )
+                        self.entry.async_create_background_task(self.hass, run(cid, cmd, sent), "SunnyHome command")
                 if not commands:
                     await asyncio.sleep(2)
             elif status == 401:
@@ -610,6 +724,11 @@ class CommandRunner:
     async def execute_inverter(self, cid: str, cmd: payload.InverterCommand | None, sent: float) -> None:
         """BAT-008: one inverter command; its result carries assumedState null."""
         outcome, reason = ("failed", "invalid_command") if cmd is None else await self.inverter.execute(cmd, sent)
+        await self.result({"commandId": cid, "outcome": outcome, "reason": reason, "assumedState": None}, time.monotonic())
+
+    async def execute_wallbox(self, cid: str, cmd: payload.WallboxCommand | None, sent: float) -> None:
+        """EV-004: one wallbox command; its result carries assumedState null. P3-2: no lease reports for wallbox rows."""
+        outcome, reason = ("failed", "invalid_command") if cmd is None else await self.wallbox.execute(cmd, sent)
         await self.result({"commandId": cid, "outcome": outcome, "reason": reason, "assumedState": None}, time.monotonic())
 
     async def result(self, body: dict, until: float) -> None:
@@ -650,6 +769,8 @@ class CommandRunner:
         if path == "claim" and self.entry.options.get(CONF_INVERTER):  # BAT-008: inverter commands only while the option is on
             headers["X-SunnyHome-Inverter"] = "1"
             headers["X-SunnyHome-Component"] = VERSION  # RA-004: from 0.6.0 SunnyHome also sends no_discharge (mode 7)
+        if path == "claim" and self.entry.options.get(CONF_WALLBOX):  # EV-004: wallbox commands only while the option is on
+            headers["X-SunnyHome-Wallbox"] = "1"
         try:
             async with async_get_clientsession(self.hass).post(
                 f"{self.url}/{path}", json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)

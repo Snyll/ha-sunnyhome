@@ -21,8 +21,8 @@ from homeassistant.helpers.selector import (
     SelectSelectorMode,
 )
 
-from . import payload, sensor_shareable, shareable, solax_remote, unshared_entries
-from .const import CONF_CONTROL, CONF_ENTITIES, CONF_INVERTER, CONF_LINK_ID, CONF_SENSORS, DEFAULT_URL, DOMAIN
+from . import payload, sensor_shareable, shareable, solax_charger, solax_remote, unshared_entries
+from .const import CONF_CONTROL, CONF_ENTITIES, CONF_INVERTER, CONF_LINK_ID, CONF_SENSORS, CONF_WALLBOX, DEFAULT_URL, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 _PAIR_ERRORS = {401: "pairing_invalid", 409: "link_limit"}
@@ -115,7 +115,8 @@ class SunnyHomeOptionsFlow(OptionsFlow):
             else:
                 self._data = {CONF_ENTITIES: chosen, CONF_CONTROL: control, CONF_SENSORS: sensors}
                 if solax_remote(self.hass) is None:  # BAT-008: no single hub with all four entities: the option is off
-                    return self.async_create_entry(data={**self._data, CONF_INVERTER: False})
+                    self._data[CONF_INVERTER] = False
+                    return await self._wallbox_or_done()
                 return await self.async_step_inverter()
         excluded = unshared_entries(self.hass)  # DEYE-003: a Deye entry's entities are never offered
         options = self._options(lambda ent: shareable(ent, excluded))
@@ -138,9 +139,23 @@ class SunnyHomeOptionsFlow(OptionsFlow):
     async def async_step_inverter(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """BAT-008: the separate inverter-control opt-in, off by default, with its own warning."""
         if user_input is not None:
-            return self.async_create_entry(data={**self._data, CONF_INVERTER: bool(user_input.get(CONF_INVERTER))})
+            self._data[CONF_INVERTER] = bool(user_input.get(CONF_INVERTER))
+            return await self._wallbox_or_done()
         schema = vol.Schema({vol.Required(CONF_INVERTER, default=bool(self.config_entry.options.get(CONF_INVERTER))): bool})
         return self.async_show_form(step_id="inverter", data_schema=schema)
+
+    async def _wallbox_or_done(self) -> ConfigFlowResult:
+        """EV-004: the Wallbox control step only with one EV-charger hub that has its three selects; else the option is off."""
+        if solax_charger(self.hass) is None:
+            return self.async_create_entry(data={**self._data, CONF_WALLBOX: False})
+        return await self.async_step_wallbox()
+
+    async def async_step_wallbox(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """EV-004: the separate wallbox-control opt-in, off by default, with its own warning."""
+        if user_input is not None:
+            return self.async_create_entry(data={**self._data, CONF_WALLBOX: bool(user_input.get(CONF_WALLBOX))})
+        schema = vol.Schema({vol.Required(CONF_WALLBOX, default=bool(self.config_entry.options.get(CONF_WALLBOX))): bool})
+        return self.async_show_form(step_id="wallbox", data_schema=schema)
 
     def _options(self, rule) -> list[SelectOptionDict]:
         """The registry entities the rule allows, labelled "name (entity id)" and sorted by label."""

@@ -54,6 +54,13 @@
         "data": {
           "inverter_control": "Povolit SunnyHome ovládat režim baterie střídače"
         }
+      },
+      "wallbox": {
+        "title": "Ovládání wallboxu",
+        "description": "**Upozornění: SunnyHome tím smí měnit pracovní režim vaší nabíječky SolaX.**\n\nKdyž je zapnuto, pravidla wallboxu v SunnyHome smí přepnout nabíječku vašeho hubu SolaX Modbus EV charger na STOP, FAST, ECO nebo GREEN. FAST nabíjí plným výkonem z jakéhokoli zdroje, i ze sítě. Pro GREEN a ECO nastaví stupeň Green nebo ECO nabíječky na 6 A a zpět ho nevrací. Nikdy nespouští ani neukončuje nabíjení. Nic se neodešle, dokud SunnyHome neověří model, firmware nabíječky a verzi SolaX Modbus a dokud v SunnyHome nepovolíte i ovládání nabíjení elektromobilu.\n\nHome Assistant vrátí nabíječku do běžného režimu wallboxu asi 15 minut poté, co SunnyHome přestane režim obnovovat, i po restartu. Když Home Assistant sám neběží, nabíječka režim podrží. Režim, který změníte ručně, zůstane, jak je. SunnyHome potřebuje, aby hub četl data alespoň každých 30 sekund. Vypnutím se aktivní režim vrátí do běžného režimu.",
+        "data": {
+          "wallbox_control": "Povolit SunnyHome nastavovat pracovní režim nabíječky"
+        }
       }
     },
     "error": {

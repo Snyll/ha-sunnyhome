@@ -54,6 +54,13 @@
         "data": {
           "inverter_control": "Allow SunnyHome to control the inverter's battery mode"
         }
+      },
+      "wallbox": {
+        "title": "Wallbox control",
+        "description": "**Warning: this lets SunnyHome change the work mode of your SolaX EV charger.**\n\nWhen on, SunnyHome's wallbox rules may set the charger of your SolaX Modbus EV charger hub to STOP, FAST, ECO or GREEN. FAST charges at full power from any source, including the grid. For GREEN and ECO it sets the charger's Green gear or ECO gear to 6 A and does not set it back. It never starts or stops a charging session. Nothing is sent unless SunnyHome has verified your charger model, firmware and SolaX Modbus version, and you also allow EV charging control in SunnyHome.\n\nHome Assistant returns the charger to the wallbox's normal mode about 15 minutes after SunnyHome stops renewing a mode, also after a restart. If Home Assistant itself is down, the charger keeps the mode. A mode you change by hand is left as it is. SunnyHome needs the hub to scan every 30 seconds or faster. Turning this off returns an active mode to the normal mode.",
+        "data": {
+          "wallbox_control": "Allow SunnyHome to set the EV charger's work mode"
+        }
       }
     },
     "error": {
