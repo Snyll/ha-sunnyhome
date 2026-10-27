@@ -30,6 +30,10 @@ PROFILE_KEYS = frozenset({
     "battery_input_energy_today", "battery_output_energy_today",
     # SRC-008 (0.7.1): grid-to-battery energy today (input register 0x91); disabled by default in solax_modbus, sent once enabled
     "e_charge_today",
+    # BATT2-006 (0.12.0): pack 1/2 of dual-battery models (GEN5 X3-Ultra, GEN6 X3-Hybrid-G4 Pro and X1-VAST; plugin_solax.py at
+    # main 1c6f72f); there battery_power_charge and battery_capacity are already the totals and battery_temperature does not exist
+    "battery_1_voltage_charge", "battery_1_current_charge", "battery_1_power_charge", "battery_1_capacity_charge", "battery_1_temperature",
+    "battery_2_voltage_charge", "battery_2_current_charge", "battery_2_power_charge", "battery_2_capacity_charge", "battery_2_temperature",
 })
 
 # SRC-009 (0.7.2): profile sensors solax_modbus ships disabled that SunnyHome turns on itself (exact home consumption).
