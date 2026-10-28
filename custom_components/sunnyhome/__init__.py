@@ -358,6 +358,7 @@ class Pusher:
         self.heat_off = False  # HA-013: the same for heat pumps and boilers, on its own, so a refused heat item never silences the others
         self.wallboxes_off = False  # WALLBOX-005: the same for the Other wallbox, on its own
         self.devices_off = False  # HA-016: the same for the entities' HA device names, on their own
+        self.air_off = False  # HA-017: the same for a climate's fan and vane pairs, on their own
         self.delay = 0
         self.retry_at = 0.0
 
@@ -520,8 +521,10 @@ class Pusher:
                 ent = registry.async_get(entity_id)
                 if ent is None or not heat_shareable(ent, excluded) or (state := self.hass.states.get(entity_id)) is None:
                     continue
+                # HA-017: after a 422 of the fan and vane pairs their lists are left out, so heat() sends none (commands still read them, seen_of)
+                attrs = {k: v for k, v in state.attributes.items() if k not in payload.AIR_LISTS} if self.air_off else state.attributes
                 items.append(payload.Entity(
-                    entity_id, state.name, state.state, None, False, state.last_reported, None, state.attributes, unit, *self.device_of(ent),
+                    entity_id, state.name, state.state, None, False, state.last_reported, None, attrs, unit, *self.device_of(ent),
                 ))
         return items[: payload.MAX_ENTITIES]
 
@@ -640,6 +643,11 @@ class Pusher:
             self.stopped = True
             _LOGGER.warning("SunnyHome refused the token; pair again with a new code")
             self.entry.async_start_reauth(self.hass)
+        elif status == 422 and not self.air_off and any(key in e.get("heat", {}) for e in body["entities"] for key in ("fanModes", "swingModes", "swingHorizontalModes")):
+            # HA-017: the newest item stops first, so a server before HA-017 (an older or rolled back one) stops only the fan and vane pairs.
+            self.air_off = True
+            _LOGGER.warning("SunnyHome rejected a post carrying fan and vane settings (HTTP 422), probably because its server is older (or another item was refused); "
+                            "not sending them until this integration is reloaded")
         elif status == 422 and not self.devices_off and any("deviceName" in e for e in body["entities"] + body.get("sensors", [])):
             # HA-016: the newest item stops first, so a server before HA-016 (an older or rolled back one) stops only the device names.
             self.devices_off = True

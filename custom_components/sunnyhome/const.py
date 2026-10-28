@@ -1,7 +1,7 @@
 """Constants of the SunnyHome integration."""
 
 DOMAIN = "sunnyhome"
-VERSION = "0.18.0"  # manifest.json's version, sent on every claim (RA-004; HA-014: SunnyHome sends heat commands only to 0.16.0 or later; WALLBOX-005: set_current only to 0.17.0 or later)
+VERSION = "0.19.0"  # manifest.json's version, sent on every claim (RA-004; HA-014: SunnyHome sends heat commands only to 0.16.0 or later; WALLBOX-005: set_current only to 0.17.0 or later; HA-017: fan / swing commands only for lists a 0.19.0+ component reported)
 DEFAULT_URL = "https://sunnyhome.cloud"
 CONF_LINK_ID = "link_id"
 CONF_ENTITIES = "entities"

@@ -169,6 +169,12 @@ BINARY_CLASSES = frozenset({"door", "window", "garage_door", "opening", "motion"
 HEAT_DOMAINS = frozenset({"climate", "water_heater"})
 MAX_HEAT_TEXT = 32  # a mode, an action or the state (UTF-16 code units, like the server)
 MAX_HEAT_MODES = 8
+# HA-017 (0.19.0): a climate's fan speed and vertical / horizontal vane (HA attribute, list attribute, our value key, our list key); each pair is sent only
+# when HA reports the list, at most MAX_AIR_MODES distinct values (MELCloud's horizontal vane has 8). The server refuses a half pair or one on a water heater.
+AIR = (("fan_mode", "fan_modes", "fanMode", "fanModes"), ("swing_mode", "swing_modes", "swingMode", "swingModes"),
+       ("swing_horizontal_mode", "swing_horizontal_modes", "swingHorizontalMode", "swingHorizontalModes"))
+AIR_LISTS = frozenset(item[1] for item in AIR)
+MAX_AIR_MODES = 16
 HEAT_LIMIT = 1000  # a number beyond it is not a temperature
 # HA-014 (0.16.0): the heat entities a command may name (the same id bounds as the readings above).
 _HEAT_ENTITY = re.compile(r"climate\.[a-z0-9_]{1,199}|water_heater\.[a-z0-9_]{1,194}")
@@ -299,7 +305,7 @@ def heat(domain: str, state: str, attributes: Mapping | None, unit: str | None) 
     listed = attributes.get("hvac_modes" if domain == "climate" else "operation_list")
     modes = [m for m in listed if _heat_text(m)][:MAX_HEAT_MODES] if isinstance(listed, (list, tuple)) else []
     mode = _heat_text(state if domain == "climate" else attributes.get("operation_mode", state)) if live else None
-    return {
+    result = {
         "current": _heat_number(attributes.get("current_temperature")),
         "target": _heat_number(attributes.get("temperature")),
         "min": low, "max": high, "step": step if step is not None and step > 0 else 0.5 if unit == "°C" else 1.0,
@@ -307,6 +313,12 @@ def heat(domain: str, state: str, attributes: Mapping | None, unit: str | None) 
         "action": _heat_text(attributes.get("hvac_action")) if domain == "climate" else None,
         "unit": unit,
     }
+    for attr, list_attr, key, list_key in AIR if domain == "climate" else ():  # HA-017: only the pairs HA reports a usable list for
+        listed = attributes.get(list_attr)
+        values = list(dict.fromkeys(m for m in listed if _heat_text(m)))[:MAX_AIR_MODES] if isinstance(listed, (list, tuple)) else []
+        if values:
+            result[key], result[list_key] = _heat_text(attributes.get(attr)), values
+    return result
 
 
 def _entity(e: Entity, control: Collection[str]) -> dict:
@@ -506,6 +518,10 @@ _LEASED_KEYS = _COMMAND_KEYS | {"leaseS"}
 _HEAT_KEYS = _COMMAND_KEYS | {"value", "mode"}
 _HEAT_LEASED_KEYS = _HEAT_KEYS | {"leaseS"}
 HEAT_ACTIONS = ("set_temperature", "set_mode")
+# HA-017: a climate's fan / vane commands: the value rides in mode (the _HEAT_KEYS shape), never leased; action -> (value key, list key, service field).
+AIR_ACTIONS = {"set_fan_mode": ("fanMode", "fanModes", "fan_mode"),
+               "set_swing_mode": ("swingMode", "swingModes", "swing_mode"),
+               "set_swing_horizontal_mode": ("swingHorizontalMode", "swingHorizontalModes", "swing_horizontal_mode")}
 HEAT_RESTORE_GIVE_UP_S = 3600  # a restore not confirmed within an hour of the lease end is given up (a try puts back only what still shows the lease's value)
 _UNAVAILABLE = ("unavailable", "unknown")
 LEASE_MIN_S, LEASE_MAX_S = 60, 3600
@@ -565,6 +581,7 @@ def parse_command(item: object) -> tuple[str | None, Command | None]:
             item.keys() in (_HEAT_KEYS, _HEAT_LEASED_KEYS) and level is None and type(ttl) is int and ttl >= 0
             and (action == "set_temperature" and _heat_number(value) is not None and (mode is None or _heat_text(mode) is not None) and (lease is None or leasing)
                  or action == "set_mode" and value is None and _heat_text(mode) is not None and lease is None
+                 or action in AIR_ACTIONS and entity_id.startswith("climate.") and value is None and _heat_text(mode) is not None and lease is None
                  or action == "lease_renew" and value is None and mode is None and leasing
                  or action == "lease_cancel" and value is None and mode is None and lease is None)
         )
@@ -612,7 +629,9 @@ def heat_shows(spec: dict | None, seen: Seen | None) -> bool:
 
 
 def _final_mode(cmd: Command, seen: Seen | None) -> str | None:
-    return cmd.mode if cmd.mode is not None else seen.heat.get("mode") if seen is not None and seen.heat is not None else None
+    """The hvac (operation) mode the entity ends in; HA-017: a fan / vane command's mode is its value, so it leaves the mode as shown."""
+    own = cmd.mode if cmd.action not in AIR_ACTIONS else None
+    return own if own is not None else seen.heat.get("mode") if seen is not None and seen.heat is not None else None
 
 
 def service_calls(cmd: Command, seen: Seen | None) -> list[tuple[str, str, dict]]:
@@ -622,6 +641,8 @@ def service_calls(cmd: Command, seen: Seen | None) -> list[tuple[str, str, dict]
         return [service_call(cmd)]
     domain = cmd.entity_id.split(".", 1)[0]
     data = {"entity_id": cmd.entity_id}
+    if cmd.action in AIR_ACTIONS:  # HA-017: one call, never the hvac mode or the temperature
+        return [(domain, cmd.action, {**data, AIR_ACTIONS[cmd.action][2]: cmd.mode})]
     calls = []
     if cmd.mode is not None and cmd.mode != (seen.heat.get("mode") if seen is not None and seen.heat is not None else None):
         calls.append((domain, "set_hvac_mode" if domain == "climate" else "set_operation_mode",
@@ -655,6 +676,8 @@ def reached(cmd: Command, seen: Seen | None) -> bool:
     """The target state: on or off; for a level on with the brightness within 1 %; HA-014: the target and mode of a heat command."""
     if seen is None:
         return False
+    if cmd.action in AIR_ACTIONS:  # HA-017
+        return seen.heat is not None and seen.heat.get(AIR_ACTIONS[cmd.action][0]) == cmd.mode
     if is_heat(cmd.entity_id):
         return heat_shows({"temperature": cmd.value if _final_mode(cmd, seen) != "off" else None, "mode": cmd.mode}, seen)
     if cmd.action != "level":
@@ -754,11 +777,13 @@ def _refusal(cmd: Command, until: float, env: Env) -> str | None:
     seen = env.state(eid)
     if seen is None or seen.state in _UNAVAILABLE:
         return "entity_unavailable"
-    if is_heat(eid) != (cmd.action in HEAT_ACTIONS or cmd.action == "restore"):
-        return "invalid_command"  # nothing but a target or a mode is ever sent to a heat entity (a climate has its own turn_on/turn_off)
+    if is_heat(eid) != (cmd.action in HEAT_ACTIONS or cmd.action in AIR_ACTIONS or cmd.action == "restore"):
+        return "invalid_command"  # nothing but a target or a mode is ever sent to a heat entity (a climate has its own turn_on/turn_off); HA-017: or a fan / vane value
     if is_heat(eid):
         if seen.heat is None:
             return "entity_unavailable"
+        if cmd.action in AIR_ACTIONS:  # HA-017: only a value of the list the entity reports now
+            return None if cmd.mode in seen.heat.get(AIR_ACTIONS[cmd.action][1], ()) else "mode_unsupported"
         if cmd.action == "set_temperature" and not in_range(cmd.value, seen.heat):
             return "out_of_range"
         if cmd.mode is not None and cmd.mode not in seen.heat.get("modes", ()):
