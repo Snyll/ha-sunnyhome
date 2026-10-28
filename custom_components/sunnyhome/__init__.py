@@ -39,6 +39,8 @@ its charging current (A), optionally a switch, a session energy sensor and a sta
 EV path; with the separate control option on SunnyHome may set the current (set_current) under a stored restore lease that puts the number's
 and the switch's previous values back at its end, only where they still show what the lease set (payload.GenericWallbox). If Home Assistant
 itself is down, the charger keeps its setting.
+HA-016 (0.18.0): each shared entity except a person carries its Home Assistant device's name and manufacturer, so SunnyHome's
+picker groups one device's entities together.
 """
 
 from __future__ import annotations
@@ -355,6 +357,7 @@ class Pusher:
         self.states_off = False  # HA-012: set by a 422 on a post with binary sensors or people; kept until the entry reloads
         self.heat_off = False  # HA-013: the same for heat pumps and boilers, on its own, so a refused heat item never silences the others
         self.wallboxes_off = False  # WALLBOX-005: the same for the Other wallbox, on its own
+        self.devices_off = False  # HA-016: the same for the entities' HA device names, on their own
         self.delay = 0
         self.retry_at = 0.0
 
@@ -483,6 +486,11 @@ class Pusher:
             device.model if device else None, device.sw_version if device else None,
         )
 
+    def device_of(self, ent: er.RegistryEntry) -> tuple[str | None, str | None]:
+        """HA-016: the name (the user's rename first) and manufacturer of the entity's HA device; (None, None) without one."""
+        device = dr.async_get(self.hass).async_get(ent.device_id) if ent.device_id and not self.devices_off else None
+        return (device.name_by_user or device.name, device.manufacturer) if device else (None, None)
+
     def entities(self) -> list[payload.Entity]:
         """The ticked devices that are still shareable and in the state machine."""
         registry = er.async_get(self.hass)
@@ -494,7 +502,7 @@ class Pusher:
             modes = state.attributes.get("supported_color_modes")
             items.append(payload.Entity(
                 entity_id, state.name, state.state, state.attributes.get("brightness"),
-                ent.domain == "light" and brightness_supported(modes), state.last_changed,
+                ent.domain == "light" and brightness_supported(modes), state.last_changed, None, None, None, *self.device_of(ent),
             ))
         if not self.states_off:  # HA-012: binary sensors, then people; only the state, never an attribute (a person has GPS and a zone)
             for key, rule in ((CONF_BINARY, lambda ent: binary_shareable(ent, excluded)), (CONF_PEOPLE, person_shareable)):
@@ -502,8 +510,9 @@ class Pusher:
                     ent = registry.async_get(entity_id)
                     if ent is None or not rule(ent) or (state := self.hass.states.get(entity_id)) is None:
                         continue
-                    items.append(payload.Entity(
+                    items.append(payload.Entity(  # HA-016: a person has no device (home/away only)
                         entity_id, state.name, state.state, None, False, state.last_changed, ent.device_class or ent.original_device_class,
+                        None, None, *(self.device_of(ent) if key == CONF_BINARY else (None, None)),
                     ))
         if not self.heat_off:  # HA-013: heat pumps and boilers last; the unit is the instance's (climate entities carry none); lastChanged is last_reported, the reading's time
             unit = self.hass.config.units.temperature_unit
@@ -512,7 +521,7 @@ class Pusher:
                 if ent is None or not heat_shareable(ent, excluded) or (state := self.hass.states.get(entity_id)) is None:
                     continue
                 items.append(payload.Entity(
-                    entity_id, state.name, state.state, None, False, state.last_reported, None, state.attributes, unit,
+                    entity_id, state.name, state.state, None, False, state.last_reported, None, state.attributes, unit, *self.device_of(ent),
                 ))
         return items[: payload.MAX_ENTITIES]
 
@@ -529,7 +538,7 @@ class Pusher:
                 continue
             items.append(payload.Sensor(
                 entity_id, state.name, ent.device_class or ent.original_device_class, state.state,
-                state.attributes.get("unit_of_measurement"), state.last_reported,
+                state.attributes.get("unit_of_measurement"), state.last_reported, *self.device_of(ent),
             ))
         return items
 
@@ -631,6 +640,11 @@ class Pusher:
             self.stopped = True
             _LOGGER.warning("SunnyHome refused the token; pair again with a new code")
             self.entry.async_start_reauth(self.hass)
+        elif status == 422 and not self.devices_off and any("deviceName" in e for e in body["entities"] + body.get("sensors", [])):
+            # HA-016: the newest item stops first, so a server before HA-016 (an older or rolled back one) stops only the device names.
+            self.devices_off = True
+            _LOGGER.warning("SunnyHome rejected a post carrying device names (HTTP 422), probably because its server is older (or another item was refused); "
+                            "not sending them until this integration is reloaded")
         elif status == 422 and not self.wallboxes_off and "wallboxes" in body:
             # WALLBOX-005: checked before the heat items (the newest item stops first), so a refusal of the Other wallbox (an older server, or one bad
             # entity) stops only it and the whole post goes through again.

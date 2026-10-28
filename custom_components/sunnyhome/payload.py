@@ -243,6 +243,20 @@ class Entity(NamedTuple):
     device_class: str | None = None  # HA-012: a binary sensor's class
     attributes: Mapping | None = None  # HA-013: a climate's or water heater's state attributes (read by heat(), nothing else leaves)
     unit: str | None = None  # HA-013: the temperature unit of the HA instance (hass.config.units.temperature_unit); climate entities carry none
+    device: str | None = None  # HA-016: the name of the entity's HA device (none for a person)
+    maker: str | None = None  # HA-016: that device's manufacturer
+
+
+def _short(text: object) -> str | None:
+    """A device name or maker within the server's name rule (printable, trimmed, 1-64 UTF-16 units), else None."""
+    text = text.strip() if isinstance(text, str) else ""
+    return text if text and text.isprintable() and _utf16(text) <= MAX_NAME else None
+
+
+def _device(device: str | None, maker: str | None) -> dict:
+    """HA-016: "deviceName" and "manufacturer" of an entity's HA device, only when it has a usable name (the picker groups by it)."""
+    name = _short(device)
+    return {"deviceName": name, "manufacturer": _short(maker)} if name else {}
 
 
 def _name(name: str | None, entity_id: str) -> str:
@@ -309,6 +323,7 @@ def _entity(e: Entity, control: Collection[str]) -> dict:
             "lastChanged": _iso(e.last_changed) if e.last_changed else None,
             "kind": domain,
             "heat": heat(domain, state, e.attributes, e.unit),
+            **_device(e.device, e.maker),
         }
         if control:  # HA-014: the component decides it (the control tick and TARGET_TEMPERATURE), see controllable()
             item["controllable"] = e.entity_id in control
@@ -327,6 +342,7 @@ def _entity(e: Entity, control: Collection[str]) -> dict:
         }
         if not person:
             item["deviceClass"] = e.device_class
+            item.update(_device(e.device, e.maker))
         if control:
             item["controllable"] = False
         return item
@@ -341,6 +357,7 @@ def _entity(e: Entity, control: Collection[str]) -> dict:
         "brightness": None if level is None else min(100, max(0, round(level * 100 / 255))),
         "supportsBrightness": supports,
         "lastChanged": _iso(e.last_changed) if e.last_changed else None,
+        **_device(e.device, e.maker),
     }
     if control:  # expand -> contract: the 8th key only while there is a control list (an HA-002 backend takes 7)
         item["controllable"] = e.entity_id in control
@@ -356,6 +373,8 @@ class Sensor(NamedTuple):
     state: str
     unit: str | None
     last_reported: datetime
+    device: str | None = None  # HA-016
+    maker: str | None = None
 
 
 def _utf16(text: str) -> int:
@@ -378,6 +397,7 @@ def _sensors(sensors: Sequence[Sensor]) -> list[dict]:
             "state": state if _utf16(state) <= MAX_STATE else "unknown",
             "unit": s.unit if isinstance(s.unit, str) and _utf16(s.unit) <= MAX_UNIT else None,
             "lastReported": _iso(s.last_reported),
+            **_device(s.device, s.maker),
         })
     return items[:MAX_SENSORS]
 
