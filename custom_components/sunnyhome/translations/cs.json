@@ -37,15 +37,21 @@
     "step": {
       "init": {
         "title": "Zařízení sdílená se SunnyHome",
-        "description": "Se SunnyHome se sdílejí jen zaškrtnuté spínače a světla: jejich název, stav a jas. Entity SolaX Modbus se nikdy nenabízejí.\n\n**Ovládání:** SunnyHome může zapínat, vypínat a stmívat zařízení zaškrtnutá v seznamu „Zařízení, která smí SunnyHome ovládat“, jakmile je ovládání tohoto připojení povoleno i v SunnyHome. Nikdy tam nezaškrtávejte spínač střídače, baterie ani nabíječky elektromobilu.\n\n**Senzory:** SunnyHome dostává hodnotu, jednotku a čas senzorů teploty, výkonu a energie zaškrtnutých v seznamu „Senzory, které smí SunnyHome číst“, pro svá automatizační pravidla.",
+        "description": "Se SunnyHome se sdílejí jen zaškrtnuté spínače a světla: jejich název, stav a jas. Entity SolaX Modbus se nikdy nenabízejí.\n\n**Ovládání:** SunnyHome může zapínat, vypínat a stmívat zařízení zaškrtnutá v seznamu „Zařízení, která smí SunnyHome ovládat“, jakmile je ovládání tohoto připojení povoleno i v SunnyHome. Zaškrtnout tu lze i položky z Vytápění a teplé vody. Nikdy tam nezaškrtávejte spínač střídače, baterie ani nabíječky elektromobilu.\n\n**Senzory:** SunnyHome dostává hodnotu, jednotku a čas senzorů teploty, výkonu, energie, baterie, napětí, proudu, vlhkosti, plynu a vody zaškrtnutých v seznamu „Senzory, které smí SunnyHome číst“, pro svá automatizační pravidla a widget Zařízení.\n\n**Binární senzory a lidé:** SunnyHome dostává u dveřních, okenních, garážových, otvíracích, pohybových a přítomnostních senzorů zaškrtnutých v seznamu „Binární senzory, které smí SunnyHome vidět“ jen stav zapnuto nebo vypnuto a u lidí zaškrtnutých v seznamu „Lidé, které smí SunnyHome vidět“ jen doma nebo pryč. Nikdy nedostane zónu, název místa, souřadnice ani sledovací zařízení osoby. Jsou jen ke čtení a zobrazují se ve widgetu Zařízení; SunnyHome je nikdy neovládá.\n\n**Vytápění a teplá voda:** SunnyHome dostává jen režim, aktuální a cílovou teplotu, povolený rozsah teplot a dostupné režimy tepelných čerpadel, termostatů a ohřívačů vody zaškrtnutých v seznamu „Vytápění a teplá voda, které smí SunnyHome číst“ a u termostatu to, zda topí nebo chladí. Nic dalšího se neposílá. Zobrazují se ve widgetu Zařízení. SunnyHome nastavuje cílovou teplotu nebo režim jen u těch, která jsou zaškrtnutá i v seznamu „Zařízení, která smí SunnyHome ovládat“, a jen když je ovládání tohoto připojení povoleno v SunnyHome. U změny z automatizačního pravidla vrátí Home Assistant původní cílovou teplotu a režim, jakmile pravidlo přestane změnu obnovovat, ale jen pokud je mezitím nikdo ručně nezměnil. Termostat jen s dolní a horní cílovou teplotou se neovládá nikdy.",
         "data": {
           "entities": "Sdílená zařízení",
           "control": "Zařízení, která smí SunnyHome ovládat",
-          "sensors": "Senzory, které smí SunnyHome číst"
+          "sensors": "Senzory, které smí SunnyHome číst",
+          "binary_sensors": "Binární senzory, které smí SunnyHome vidět",
+          "people": "Lidé, které smí SunnyHome vidět",
+          "heat": "Vytápění a teplá voda, které smí SunnyHome číst"
         },
         "data_description": {
-          "control": "Každé musí být zaškrtnuté i ve Sdílených zařízeních. Prázdný seznam znamená, že SunnyHome nic neovládá.",
-          "sensors": "Nejvýše 32. Prázdný seznam znamená, že SunnyHome nečte žádné senzory."
+          "control": "Každé musí být zaškrtnuté i ve Sdílených zařízeních nebo ve Vytápění a teplé vodě. Prázdný seznam znamená, že SunnyHome nic neovládá.",
+          "sensors": "Nejvýše 32. Prázdný seznam znamená, že SunnyHome nečte žádné senzory.",
+          "binary_sensors": "Dveřní, okenní, garážové, otvírací, pohybové a přítomnostní senzory: jen zapnuto nebo vypnuto. Spolu se sdílenými zařízeními, lidmi a vytápěním nejvýše 64. Prázdný seznam znamená, že SunnyHome žádné nevidí.",
+          "people": "Posílá se jen doma nebo pryč, nikdy kde osoba je. Spolu se sdílenými zařízeními, binárními senzory a vytápěním nejvýše 64. Prázdný seznam znamená, že SunnyHome nevidí nikoho.",
+          "heat": "Klimatizace (tepelná čerpadla, termostaty) a ohřívače vody (bojlery): jen režim a teploty. Spolu se sdílenými zařízeními, binárními senzory a lidmi nejvýše 64. Prázdný seznam znamená, že SunnyHome žádné nečte."
         }
       },
       "inverter": {
@@ -61,12 +67,35 @@
         "data": {
           "wallbox_control": "Povolit SunnyHome nastavovat pracovní režim nabíječky"
         }
+      },
+      "other_wallbox": {
+        "title": "Další wallbox",
+        "description": "Volitelné: sdílejte další nabíječku elektromobilu, kterou už Home Assistant zobrazuje (například Easee, Zaptec, Wallbox nebo OCPP), aby SunnyHome mohl ukázat její nabíjecí výkon a energii nabíjení.\n\n**Co se sdílí:** stav a jednotka senzoru výkonu, volitelného senzoru energie nabíjení a senzoru stavu a stav čísla nabíjecího proudu (jeho nastavená hodnota v ampérech a jeho minimum a maximum). SunnyHome z nabíječky nečte nic dalšího. Senzor výkonu a číslo nabíjecího proudu vyberte společně, nebo obojí nechte prázdné, pokud další wallbox nemáte.\n\n**Upozornění: ovládání dovoluje SunnyHome nastavovat nabíjecí proud této nabíječky.** Když je ovládání zapnuté a v SunnyHome povolíte i ovládání nabíjení elektromobilu, pravidla wallboxu smí nastavit číslo nabíjecího proudu mezi 6 A a maximem čísla (nejvýše 32 A): FAST použije maximum, ECO 6 A a STOP nabíječku vypne vybraným vypínačem (bez vypínače se na 0 nastaví jen číslo, které 0 A přijímá). SunnyHome nikdy sám nespouští ani neukončuje nabíjení. Nic se neodešle, dokud fyzická kontrola neověří model vaší nabíječky.\n\nHome Assistant vrátí předchozí proud a stav vypínače, když SunnyHome přestane nastavení obnovovat (do 30 minut), i po restartu, ale jen pokud jste je mezitím nezměnili ručně. Když Home Assistant sám neběží, nabíječka nastavení podrží. Vypnutím ovládání se předchozí hodnoty vrátí hned.",
+        "data": {
+          "other_wallbox_power": "Senzor výkonu",
+          "other_wallbox_current": "Číslo nabíjecího proudu (A)",
+          "other_wallbox_switch": "Vypínač nabíječky (volitelné)",
+          "other_wallbox_energy": "Senzor energie nabíjení (volitelné)",
+          "other_wallbox_status": "Senzor stavu (volitelné)",
+          "other_wallbox_control": "Povolit SunnyHome nastavovat nabíjecí proud této nabíječky"
+        },
+        "data_description": {
+          "other_wallbox_power": "Nabíjecí výkon nabíječky (senzor výkonu ve W nebo kW). Povinné spolu s číslem nabíjecího proudu.",
+          "other_wallbox_current": "Číslo, které nastavuje nabíjecí proud v ampérech, s vlastním minimem a maximem. Povinné spolu se senzorem výkonu.",
+          "other_wallbox_switch": "Zapíná a vypíná nabíjení. S ním STOP nabíjení vypne; bez něj STOP potřebuje číslo, které přijímá 0 A.",
+          "other_wallbox_energy": "Energie právě probíhajícího nabíjení (senzor energie v kWh nebo Wh). Nechte prázdné, pokud ho nabíječka nemá.",
+          "other_wallbox_status": "Text jako Charging nebo Disconnected; odešle se jen krátký prostý text. Nechte prázdné, pokud ho nabíječka nemá.",
+          "other_wallbox_control": "Ve výchozím stavu vypnuto. Přečtěte si upozornění výše; SunnyHome navíc potřebuje povolené ovládání nabíjení elektromobilu v SunnyHome."
+        }
       }
     },
     "error": {
-      "too_many": "Vyberte nejvýše 64 zařízení.",
-      "control_not_shared": "Zařízení, která smí SunnyHome ovládat, musí být zaškrtnutá i jako sdílená.",
-      "too_many_sensors": "Vyberte nejvýše 32 senzorů."
+      "too_many": "Vyberte nejvýše 64 zařízení, binárních senzorů, lidí a vytápění dohromady.",
+      "control_not_shared": "Zařízení, která smí SunnyHome ovládat, musí být zaškrtnutá i jako sdílená nebo jako vytápění a teplá voda.",
+      "too_many_sensors": "Vyberte nejvýše 32 senzorů.",
+      "needs_both": "Vyberte senzor výkonu i číslo nabíjecího proudu, nebo obojí nechte prázdné.",
+      "number_unit": "Číslo nabíjecího proudu musí být v ampérech (A).",
+      "number_range": "Číslo nabíjecího proudu potřebuje minimum a maximum, které připouští nějaký proud mezi 6 A a 32 A."
     }
   },
   "issues": {

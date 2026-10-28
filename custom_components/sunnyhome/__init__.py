@@ -26,10 +26,19 @@ DEYE-003 (0.10.0): the single inverter entry may instead be a Deye inverter of t
 an entry whose inverter device's manufacturer starts with "Deye"; Home Assistant core's Solarman plugs and meters never count). Its
 sensors (payload.DEYE_KEYS) are posted as "inverter" once the Device sensor's Serial Number attribute holds a valid serial (never the
 registry serial, which falls back to the logger's); its entities are never shared. Read only: no solarman service is ever called.
+HA-014 (0.16.0): a ticked heat pump or boiler (climate, water_heater) that supports a target temperature may be commanded: set_temperature
+(bounded by its own min, max and step) and set_mode (one of its modes) through the same claim route. A rule's change carries a lease that
+stores the previous target and mode (a "restore" lease, payload.Lease); at its end, on a cancel or when SunnyHome stops renewing, the
+previous values are put back where the entity still shows the values the lease set, and a change by hand ends the lease without a restore.
 EV-004 (0.11.0): a solax_modbus hub of the EV-charger plugin (solax_ev_charger) is never an inverter entry, so it sits beside the
 inverter hub. Its readings and work mode are posted as "wallbox"; with the separate Wallbox control option on SunnyHome may set its
 work mode (charger_use_mode, GREEN and ECO at their 6 A gear) under a stored lease that returns it to the wallbox's normal mode when
 SunnyHome stops renewing (payload.Wallbox). If Home Assistant itself is down the charger keeps the mode. One EV-charger hub only.
+WALLBOX-005 (0.17.0): any other charger Home Assistant shows: the options' Other wallbox step names its power sensor and the number that sets
+its charging current (A), optionally a switch, a session energy sensor and a status sensor. They are posted as "wallboxes" beside the SolaX
+EV path; with the separate control option on SunnyHome may set the current (set_current) under a stored restore lease that puts the number's
+and the switch's previous values back at its end, only where they still show what the lease set (payload.GenericWallbox). If Home Assistant
+itself is down, the charger keeps its setting.
 """
 
 from __future__ import annotations
@@ -58,7 +67,10 @@ from homeassistant.helpers.event import async_track_state_change_event, async_tr
 from homeassistant.util import dt as dt_util
 
 from . import payload
-from .const import CONF_CONTROL, CONF_ENTITIES, CONF_INVERTER, CONF_SENSORS, CONF_WALLBOX, DOMAIN, VERSION
+from .const import (
+    CONF_BINARY, CONF_CONTROL, CONF_ENTITIES, CONF_HEAT, CONF_INVERTER, CONF_OTHER_WALLBOX, CONF_OW_CURRENT, CONF_OW_ENERGY, CONF_OW_POWER,
+    CONF_OW_STATUS, CONF_OW_SWITCH, CONF_PEOPLE, CONF_SENSORS, CONF_WALLBOX, DOMAIN, VERSION,
+)
 
 _LOGGER = logging.getLogger(__name__)
 SOLAX = "solax_modbus"
@@ -81,6 +93,7 @@ REMOTE_KEYS = {
 # EV-004: the EV-charger hub's selects, by role (unique id key after "<hub name>_").
 CHARGER_KEYS = {"mode": "charger_use_mode", "green_gear": "green_gear", "eco_gear": "eco_gear"}
 CHARGER_LOCK = "solax_modbus:ev"  # its own hub lock: inverter and charger commands never wait for each other
+OTHER_WALLBOX_LOCK = "other_wallbox"  # WALLBOX-005: its own lock too
 _warned_chargers = False
 
 
@@ -124,6 +137,26 @@ def solax_charger(hass: HomeAssistant) -> payload.Charger | None:
     return payload.Charger(**found, scan_s=charger_scan(hub)) if len(found) == len(CHARGER_KEYS) else None
 
 
+def other_wallbox(entry: ConfigEntry) -> payload.OtherWallbox | None:
+    """WALLBOX-005: the entities of the Other wallbox options, or None unless both the power sensor and the current number are set."""
+    options = entry.options
+    power, number = options.get(CONF_OW_POWER), options.get(CONF_OW_CURRENT)
+    if not power or not number:
+        return None
+    return payload.OtherWallbox(number, options.get(CONF_OW_SWITCH) or None, power, options.get(CONF_OW_ENERGY) or None, options.get(CONF_OW_STATUS) or None)
+
+
+def generic_config(hass: HomeAssistant, entry: ConfigEntry) -> payload.GenericConfig | None:
+    """WALLBOX-005: the Other wallbox's number and switch with the range from the number's own min and max; None while it is not set up or the
+    number is not in the state machine. A range that is not usable is carried as None (an apply is then refused outside_range)."""
+    wallbox = other_wallbox(entry)
+    state = hass.states.get(wallbox.number) if wallbox else None
+    if state is None:
+        return None
+    rng = payload.generic_range(state.attributes.get("min"), state.attributes.get("max")) or (None, None, False)
+    return payload.GenericConfig(wallbox.number, wallbox.switch, *rng)
+
+
 def deye_entries(hass: HomeAssistant) -> list[ConfigEntry]:
     """DEYE-003: the one Deye rule, for counting, dispatch, the repair issue, BAT-008 and sharing: a solarman entry whose inverter
     device's manufacturer starts with "Deye" (ha-solarman sets "Deye"; core Solarman plugs and meters "SOLARMAN")."""
@@ -154,7 +187,8 @@ def shareable(ent: er.RegistryEntry, excluded: frozenset[str] = frozenset()) -> 
 
 
 def sensor_shareable(ent: er.RegistryEntry, excluded: frozenset[str] = frozenset()) -> bool:
-    """The allow-list rule for picked sensors (HA-005): an enabled temperature, power or energy sensor, not of an inverter integration."""
+    """The allow-list rule for picked sensors (HA-005): an enabled sensor of a payload.SENSOR_CLASSES class (HA-011: temperature, power, energy, battery, voltage,
+    current, humidity, gas, water), not of an inverter integration."""
     return (
         ent.domain == "sensor" and ent.platform not in INVERTERS and not ent.disabled
         and not (excluded and ent.config_entry_id in excluded)
@@ -163,14 +197,51 @@ def sensor_shareable(ent: er.RegistryEntry, excluded: frozenset[str] = frozenset
     )
 
 
+def binary_shareable(ent: er.RegistryEntry, excluded: frozenset[str] = frozenset()) -> bool:
+    """HA-012: an enabled binary sensor of a payload.BINARY_CLASSES class (door, window, garage door, opening, motion, occupancy), not of an
+    inverter integration."""
+    return (
+        ent.domain == "binary_sensor" and ent.platform not in INVERTERS and not ent.disabled
+        and not (excluded and ent.config_entry_id in excluded)
+        and (ent.device_class or ent.original_device_class) in payload.BINARY_CLASSES
+        and payload._STATE_ID.fullmatch(ent.entity_id) is not None
+    )
+
+
+def person_shareable(ent: er.RegistryEntry) -> bool:
+    """HA-012: an enabled person entity (shared as home or away only, see payload._person_state)."""
+    return ent.domain == "person" and not ent.disabled and payload._STATE_ID.fullmatch(ent.entity_id) is not None
+
+
+def heat_shareable(ent: er.RegistryEntry, excluded: frozenset[str] = frozenset()) -> bool:
+    """HA-013: an enabled climate or water_heater entity (a heat pump or boiler) that is not of an inverter integration; read only."""
+    return (
+        ent.domain in payload.HEAT_DOMAINS and ent.platform not in INVERTERS and not ent.disabled
+        and not (excluded and ent.config_entry_id in excluded)
+        and payload._STATE_ID.fullmatch(ent.entity_id) is not None
+    )
+
+
+def heat_controllable(state) -> bool:
+    """HA-014: a heat entity supports a target temperature (feature bit 1 of climate and of water_heater); one that is not in the state machine
+    or unavailable keeps its last decision (true), so a lease end is never skipped just because the device blinked. A dual setpoint only
+    (feature bit 2) stays read only."""
+    if state is None or state.state in ("unavailable", "unknown"):
+        return True
+    features = state.attributes.get("supported_features")
+    return isinstance(features, int) and features & 1 == 1
+
+
 def controllable(hass: HomeAssistant, entry: ConfigEntry) -> set[str]:
-    """The control list as enforced: ticked for control, still shared and still shareable."""
+    """The control list as enforced: ticked for control, still shared and still shareable. HA-014: a ticked heat entity that supports a target."""
     registry = er.async_get(hass)
     shared = entry.options.get(CONF_ENTITIES, [])[: payload.MAX_ENTITIES]
+    heat = entry.options.get(CONF_HEAT, [])[: payload.MAX_ENTITIES]
     excluded = unshared_entries(hass)
     return {
         e for e in entry.options.get(CONF_CONTROL, [])
-        if e in shared and (ent := registry.async_get(e)) is not None and shareable(ent, excluded)
+        if (e in shared and (ent := registry.async_get(e)) is not None and shareable(ent, excluded))
+        or (e in heat and (ent := registry.async_get(e)) is not None and heat_shareable(ent, excluded) and heat_controllable(hass.states.get(e)))
     }
 
 
@@ -212,8 +283,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # AUTO-004: the leases are kept with or without a control list (an empty list drops them) and whatever the token's state,
     # so a lease still ends its device after an unlink.
     await runner.start_leases()
-    # BAT-008: the inverter option alone also claims; EV-004: so does the Wallbox control option
-    if entry.options.get(CONF_CONTROL) or entry.options.get(CONF_INVERTER) or entry.options.get(CONF_WALLBOX):
+    # BAT-008: the inverter option alone also claims; EV-004: so does the Wallbox control option; WALLBOX-005: and the Other wallbox control option
+    if entry.options.get(CONF_CONTROL) or entry.options.get(CONF_INVERTER) or entry.options.get(CONF_WALLBOX) or entry.options.get(CONF_OTHER_WALLBOX):
         # An entry background task: HA cancels it, and the commands it started, on unload or reload.
         entry.async_create_background_task(hass, runner.run(), "SunnyHome commands")
     return True
@@ -255,6 +326,22 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
         except Exception as err:  # noqa: BLE001 - best effort
             _LOGGER.debug("Wallbox exit at removal failed: %s", type(err).__name__)
     await store.async_remove()
+    # WALLBOX-005: the same for a stored Other wallbox lease: the previous values go back only where the charger still shows what the lease set
+    store = storage.Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.wallbox_generic")
+    if (lease := payload.generic_lease(await store.async_load())) and (cfg := generic_config(hass, entry)):
+        number, switch = hass.states.get(cfg.number), hass.states.get(cfg.switch) if cfg.switch else None
+        try:
+            amps, on = float(number.state), {"on": True, "off": False}.get(switch.state) if switch else None
+        except (AttributeError, TypeError, ValueError):
+            amps = on = None
+        if amps is not None and (cfg.switch is None or on is not None):
+            for domain, service, data, _, _ in payload.generic_back_calls(cfg, payload.generic_verdict(lease, amps, on)[1] or {}):
+                try:
+                    await hass.services.async_call(domain, service, data, blocking=True)
+                except Exception as err:  # noqa: BLE001 - best effort
+                    _LOGGER.debug("Other wallbox restore at removal failed: %s", type(err).__name__)
+                    break
+    await store.async_remove()
 
 
 class Pusher:
@@ -265,6 +352,9 @@ class Pusher:
         self.url = f"{entry.data[CONF_URL]}/api/ha/v1/states"
         self.headers = {"Authorization": f"Bearer {entry.data[CONF_TOKEN]}"}
         self.busy = self.stopped = self.warned = False
+        self.states_off = False  # HA-012: set by a 422 on a post with binary sensors or people; kept until the entry reloads
+        self.heat_off = False  # HA-013: the same for heat pumps and boilers, on its own, so a refused heat item never silences the others
+        self.wallboxes_off = False  # WALLBOX-005: the same for the Other wallbox, on its own
         self.delay = 0
         self.retry_at = 0.0
 
@@ -302,6 +392,7 @@ class Pusher:
         return payload.build(
             dt_util.utcnow(), serial, readings, self.entities(), controllable(self.hass, self.entry), self.sensors(),
             self.remote(readings) if solax else None, self.settings(hub, profile) if profile else None, domain, info, self.wallbox(),
+            None if self.wallboxes_off else self.other_wallboxes(),
         )
 
     def wallbox(self) -> dict | None:
@@ -335,6 +426,28 @@ class Pusher:
             plugin = None
         control = payload.wallbox_control(reason is None, reason, plugin, device.model if device else None, device.sw_version if device else None)
         return payload.wallbox_report(device.serial_number if device else None, readings, control)
+
+    def other_wallboxes(self) -> list[dict] | None:
+        """WALLBOX-005: the Other wallbox's item (power, session energy, status, the switch state and the number's own state as "current", and the control report),
+        or None unless it is set up. The current is left out while the number still shows SunnyHome's own write (no real poll since)."""
+        wallbox = other_wallbox(self.entry)
+        if wallbox is None:
+            return None
+        echoes = self.hass.data.setdefault(DOMAIN, {}).setdefault("echoes", {})
+        readings = []
+        for key, entity_id in (("power", wallbox.power), ("energy", wallbox.energy), ("current", wallbox.number), ("status", wallbox.status), ("switch", wallbox.switch)):
+            state = self.hass.states.get(entity_id) if entity_id else None
+            if state is None or state.last_reported is None:
+                continue
+            if key == "current" and (echo := echoes.get(entity_id)) is not None and state.last_reported.timestamp() <= echo:
+                continue
+            readings.append((key, "A" if key == "current" else state.attributes.get("unit_of_measurement"), state.state, state.last_reported))
+        cfg = generic_config(self.hass, self.entry)
+        entry = er.async_get(self.hass).async_get(wallbox.number)
+        rng = (cfg.min_a, cfg.max_a, cfg.allows_zero) if cfg and cfg.min_a is not None else None
+        control = payload.generic_control(bool(self.entry.options.get(CONF_OTHER_WALLBOX)), cfg is not None, rng,
+                                          getattr(entry, "platform", None), wallbox.switch is not None)
+        return [payload.generic_report(wallbox.number, wallbox.switch, readings, control)]
 
     def settings(self, hub: ConfigEntry, profile: str = SOLAX) -> dict | None:
         """ISET-004: the states of the hub's entities its integration's profile names, as "<domain>.<unique id key>"; read only.
@@ -383,7 +496,25 @@ class Pusher:
                 entity_id, state.name, state.state, state.attributes.get("brightness"),
                 ent.domain == "light" and brightness_supported(modes), state.last_changed,
             ))
-        return items
+        if not self.states_off:  # HA-012: binary sensors, then people; only the state, never an attribute (a person has GPS and a zone)
+            for key, rule in ((CONF_BINARY, lambda ent: binary_shareable(ent, excluded)), (CONF_PEOPLE, person_shareable)):
+                for entity_id in self.entry.options.get(key, [])[: payload.MAX_ENTITIES]:
+                    ent = registry.async_get(entity_id)
+                    if ent is None or not rule(ent) or (state := self.hass.states.get(entity_id)) is None:
+                        continue
+                    items.append(payload.Entity(
+                        entity_id, state.name, state.state, None, False, state.last_changed, ent.device_class or ent.original_device_class,
+                    ))
+        if not self.heat_off:  # HA-013: heat pumps and boilers last; the unit is the instance's (climate entities carry none); lastChanged is last_reported, the reading's time
+            unit = self.hass.config.units.temperature_unit
+            for entity_id in self.entry.options.get(CONF_HEAT, [])[: payload.MAX_ENTITIES]:
+                ent = registry.async_get(entity_id)
+                if ent is None or not heat_shareable(ent, excluded) or (state := self.hass.states.get(entity_id)) is None:
+                    continue
+                items.append(payload.Entity(
+                    entity_id, state.name, state.state, None, False, state.last_reported, None, state.attributes, unit,
+                ))
+        return items[: payload.MAX_ENTITIES]
 
     def sensors(self) -> list[payload.Sensor] | None:
         """The ticked sensors still shareable and in the state machine; None (no "sensors" key) while none is ticked (HA-005)."""
@@ -500,6 +631,22 @@ class Pusher:
             self.stopped = True
             _LOGGER.warning("SunnyHome refused the token; pair again with a new code")
             self.entry.async_start_reauth(self.hass)
+        elif status == 422 and not self.wallboxes_off and "wallboxes" in body:
+            # WALLBOX-005: checked before the heat items (the newest item stops first), so a refusal of the Other wallbox (an older server, or one bad
+            # entity) stops only it and the whole post goes through again.
+            self.wallboxes_off = True
+            _LOGGER.warning("SunnyHome rejected a post carrying the other wallbox (HTTP 422), probably because its server is older (or another item was refused); "
+                            "not sending it until this integration is reloaded")
+        elif status == 422 and not self.heat_off and any("heat" in e for e in body["entities"]):
+            # HA-013: checked first, so a refusal of the heat items (an older server, or one bad device) stops only them, not the binary sensors and people.
+            self.heat_off = True
+            _LOGGER.warning("SunnyHome rejected a post carrying heat pumps or boilers (HTTP 422), probably because its server is older (or another item was refused); "
+                            "not sending them until this integration is reloaded")
+        elif status == 422 and not self.states_off and any("kind" in e for e in body["entities"]):
+            # HA-012: a server before 0.14.0 refuses the new items and with them the whole post, every cycle: stop sending them.
+            self.states_off = True
+            _LOGGER.warning("SunnyHome rejected a post carrying binary sensors and people (HTTP 422), probably because its server is older (or another item was refused); "
+                            "not sending them until this integration is reloaded")
         elif status in (413, 422):
             if not self.warned:
                 self.warned = True
@@ -541,10 +688,16 @@ class CommandRunner:
             shared["locks"].setdefault(CHARGER_LOCK, asyncio.Lock()), lambda: solax_charger(hass),
             lambda: bool(entry.options.get(CONF_WALLBOX)), self.select_state, self.dispatch, self.save_wallbox, shared.setdefault("echoes", {}),
         )
+        # WALLBOX-005: the Other wallbox lease has its own store and lock too; it shares the echoes with the pusher (the number's own write)
+        self.generic_store = storage.Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.wallbox_generic")
+        self.generic = payload.GenericWallbox(
+            shared["locks"].setdefault(OTHER_WALLBOX_LOCK, asyncio.Lock()), lambda: generic_config(hass, entry),
+            lambda: bool(entry.options.get(CONF_OTHER_WALLBOX)), self.select_state, self.dispatch, self.save_generic, shared.setdefault("echoes", {}),
+        )
         self.env = payload.Env(
             shared["locks"], shared.setdefault("inflight", {}),
             lambda entity_id: entity_id in controllable(hass, entry), self.seen, self.dispatch,
-            leases=self.leases, save=self.save,
+            leases=self.leases, save=self.save, dispatch_many=self.dispatch_many,
         )
 
     async def start_leases(self) -> None:
@@ -553,7 +706,7 @@ class CommandRunner:
         self.restarted = {eid for eid, _ in self.leases.due(time.time())}
         self.entry.async_on_unload(async_track_time_interval(self.hass, self.lease_tick, timedelta(seconds=LEASE_TICK_S), name="SunnyHome leases"))
         # HA's callback marks a function object; a bound method refuses the attribute (AttributeError), so wrap it.
-        self.entry.async_on_unload(async_track_state_change_event(self.hass, sorted(controllable(self.hass, self.entry)),
+        self.entry.async_on_unload(async_track_state_change_event(self.hass, sorted(self.entry.options.get(CONF_CONTROL, [])[: payload.MAX_ENTITIES]),  # PLAN-031 integration: the ticked list, not the filtered one: a heat entity that blinked is still watched
                                                                   callback(lambda event: self.state_changed(event))))
         self.entry.async_create_background_task(self.hass, self.send_reports(), "SunnyHome lease reports")
         # BAT-008: the inverter lease survives unload, reload and restart; the tick also ends it when the option was turned off.
@@ -568,6 +721,12 @@ class CommandRunner:
         self.entry.async_on_unload(async_track_time_interval(
             self.hass, self.wallbox.tick, timedelta(seconds=LEASE_TICK_S), name="SunnyHome wallbox lease"
         ))
+        # WALLBOX-005: the Other wallbox lease survives unload, reload and restart; the tick also ends it when the option was turned off.
+        self.generic.load(await self.generic_store.async_load())
+        self.entry.async_on_unload(lambda: setattr(self.generic, "unloaded", True))
+        self.entry.async_on_unload(async_track_time_interval(
+            self.hass, self.generic.tick, timedelta(seconds=LEASE_TICK_S), name="SunnyHome other wallbox lease"
+        ))
 
     async def save_inverter(self, data: dict | None) -> None:
         if data is None:
@@ -581,8 +740,14 @@ class CommandRunner:
         else:
             await self.wallbox_store.async_save(data)
 
+    async def save_generic(self, data: dict | None) -> None:
+        if data is None:
+            await self.generic_store.async_remove()
+        else:
+            await self.generic_store.async_save(data)
+
     def select_state(self, entity_id: str) -> tuple[str | None, float | None] | None:
-        """EV-004: a select's state and its last_reported (UTC seconds), or None."""
+        """EV-004: a select's state and its last_reported (UTC seconds), or None; WALLBOX-005: also a number's or switch's."""
         if (state := self.hass.states.get(entity_id)) is None:
             return None
         return state.state, state.last_reported.timestamp() if state.last_reported else None
@@ -606,8 +771,11 @@ class CommandRunner:
                 if eid not in controllable(self.hass, self.entry):  # the user took the device out of SunnyHome's hands: left as it is
                     await self._drop(eid, lease, "lease_cancelled", "not_controllable")
                     continue
-                if now > lease.until + LEASE_GIVE_UP_S:  # ponytail: a device not seen off for a day is given up
+                if now > lease.until + (payload.HEAT_RESTORE_GIVE_UP_S if lease.target == "restore" else LEASE_GIVE_UP_S):  # ponytail: a device not seen off for a day is given up
                     await self._drop(eid, lease, "lease_cancelled", None)
+                    continue
+                if lease.target == "restore":  # HA-014: before the "off" test below: for a climate "off" is a mode, not the lease's end
+                    await self._restore_due(eid, lease)
                     continue
                 seen = self.seen(eid)
                 if seen is None or seen.state in ("unavailable", "unknown"):
@@ -628,6 +796,25 @@ class CommandRunner:
         finally:
             self.ticking = False
 
+    async def _restore_due(self, eid: str, lease: payload.Lease) -> None:
+        """HA-014: a restore lease that ended: the previous target and mode go back where the entity still shows what the lease set (ended
+        when it shows the previous values already); anything else was changed by hand (cancelled, nothing restored). A restore that is not
+        confirmed keeps the lease; it is tried again after a minute, for at most an hour (HEAT_RESTORE_GIVE_UP_S)."""
+        seen = self.seen(eid)
+        if seen is None or seen.state in ("unavailable", "unknown"):
+            return  # retried at the next check
+        if time.monotonic() < self.off_sent.get(eid, -LEASE_OFF_RETRY_S) + LEASE_OFF_RETRY_S:
+            return
+        outcome, reason, _ = await payload.restore(eid, lease, self.env)
+        if outcome == "done":
+            await self._drop(eid, lease, "lease_ended", "restart" if eid in self.restarted else None)
+        elif reason == "lease_changed":
+            return  # PLAN-031 integration: the lease was replaced while this check waited: the new one is not ours to drop
+        elif reason == "outside_change":
+            await self._drop(eid, lease, "lease_cancelled", "outside_change")
+        elif eid in self.leases.items:
+            self.off_sent[eid] = time.monotonic()
+
     async def _drop(self, eid: str, lease: payload.Lease, outcome: str, reason: str | None) -> None:
         self.leases.cancel(eid)
         await self.save()
@@ -642,6 +829,9 @@ class CommandRunner:
         lease = self.leases.items.get(eid)
         if lease is None or old is None or new is None or new.state in ("unavailable", "unknown"):
             return  # no lease, HA starting or the entity gone: not a change by anyone
+        if lease.target == "restore":  # HA-014: before the "off" test below: a climate's "off" is a mode
+            self.heat_changed(eid, lease, new)
+            return
         if new.state == "off" and lease.until <= time.time():
             # The lease's own off, confirmed late (perhaps under another context): the lease ends here, so a later hand "on" finds
             # no lease and is never undone by a second off (post R2). During a lease off execute holds no lease, so this never doubles.
@@ -657,6 +847,29 @@ class CommandRunner:
             return  # a confirmation (often under another context) that keeps the target
         ours = self.contexts.get(eid)
         if ours is not None and ours in (new.context.id, new.context.parent_id):
+            return
+        self.leases.cancel(eid)
+        self.hass.async_create_task(self.save(), "SunnyHome lease save")
+        self.report(lease.command, "lease_cancelled", "outside_change")
+
+    def heat_changed(self, eid: str, lease: payload.Lease, new) -> None:
+        """HA-014: a change that leaves what a restore lease set, and is not SunnyHome's own, ends the lease without a restore (outside_change).
+        While a command or a restore runs on the entity (its lock is held) nothing counts; the lease check sees what is left."""
+        seen = self.seen_of(new)
+        if payload.at_target(lease, seen):
+            return  # a confirmation, or an attribute that is not the lease's (the current temperature, the action)
+        if (lock := self.env.locks.get(eid)) is not None and lock.locked():
+            return
+        ours = self.contexts.get(eid)
+        if ours is not None and ours in (new.context.id, new.context.parent_id):
+            return
+        if lease.until <= time.time() and payload.heat_verdict(lease, seen)[0] == "ended":
+            # PLAN-031 integration: the restore, confirmed late (perhaps under another context): the lease ends here, as a switch's late off does.
+            self.leases.cancel(eid)
+            self.off_sent.pop(eid, None)
+            self.hass.async_create_task(self.save(), "SunnyHome lease save")
+            self.report(lease.command, "lease_ended", "restart" if eid in self.restarted else None)
+            self.restarted.discard(eid)
             return
         self.leases.cancel(eid)
         self.hass.async_create_task(self.save(), "SunnyHome lease save")
@@ -694,9 +907,10 @@ class CommandRunner:
                 delay = 0
                 for item in commands:
                     inverter = isinstance(item, dict) and "inverter" in item  # BAT-008
-                    wallbox = isinstance(item, dict) and "wallbox" in item  # EV-004
-                    parse = payload.parse_wallbox if wallbox else payload.parse_inverter if inverter else payload.parse_command
-                    run = self.execute_wallbox if wallbox else self.execute_inverter if inverter else self.execute
+                    generic = isinstance(item, dict) and item.get("wallbox") == "set_current"  # WALLBOX-005
+                    wallbox = isinstance(item, dict) and "wallbox" in item and not generic  # EV-004
+                    parse = payload.parse_generic if generic else payload.parse_wallbox if wallbox else payload.parse_inverter if inverter else payload.parse_command
+                    run = self.execute_generic if generic else self.execute_wallbox if wallbox else self.execute_inverter if inverter else self.execute
                     cid, cmd = parse(item)
                     if cid is not None:  # an invalid command without a valid id is dropped
                         self.entry.async_create_background_task(self.hass, run(cid, cmd, sent), "SunnyHome command")
@@ -731,6 +945,11 @@ class CommandRunner:
         outcome, reason = ("failed", "invalid_command") if cmd is None else await self.wallbox.execute(cmd, sent)
         await self.result({"commandId": cid, "outcome": outcome, "reason": reason, "assumedState": None}, time.monotonic())
 
+    async def execute_generic(self, cid: str, cmd: payload.GenericCommand | None, sent: float) -> None:
+        """WALLBOX-005: one set_current command (an apply, a renewal or a restore); its result carries assumedState null, like a wallbox command."""
+        outcome, reason = ("failed", "invalid_command") if cmd is None else await self.generic.execute(cmd, sent)
+        await self.result({"commandId": cid, "outcome": outcome, "reason": reason, "assumedState": None}, time.monotonic())
+
     async def result(self, body: dict, until: float) -> None:
         delay = 1
         # The server takes the result once and answers 200 to repeats; retry until 30 s past the deadline.
@@ -741,20 +960,38 @@ class CommandRunner:
     def seen(self, entity_id: str) -> payload.Seen | None:
         if (state := self.hass.states.get(entity_id)) is None:
             return None
+        return self.seen_of(state)
+
+    def seen_of(self, state) -> payload.Seen:
         attrs = state.attributes
+        # HA-014: a heat entity carries heat() of its state: the target, mode, range, step and modes the component reports
+        heat = payload.heat(state.domain, state.state, attrs, self.hass.config.units.temperature_unit) if state.domain in payload.HEAT_DOMAINS else None
         return payload.Seen(
             state.state, attrs.get("brightness"),
             state.domain == "light" and brightness_supported(attrs.get("supported_color_modes")),
-            attrs.get("assumed_state") is True,
+            attrs.get("assumed_state") is True, heat,
         )
 
     def dispatch(self, domain: str, service: str, data: dict) -> asyncio.Task:
+        return self.start([(domain, service, data)])
+
+    def dispatch_many(self, calls: list) -> asyncio.Task:
+        """HA-014: several service calls of one command in one task and one context, in order; a call that raises ends the task (the rest is not sent)."""
+        return self.start(calls)
+
+    def start(self, calls: list) -> asyncio.Task:
+        domain, service, data = calls[0]
         # AUTO-004: its own context, so a lease does not take this call's state change for one from another context.
         context = Context()
         self.contexts[data["entity_id"]] = context.id
+
+        async def run() -> None:
+            for call_domain, call_service, call_data in calls:
+                await self.hass.services.async_call(call_domain, call_service, call_data, blocking=True, context=context)
         # A hass task, never cancelled (not even on unload): the entity stays busy until the call ends.
         task = self.hass.async_create_task(
-            self.hass.services.async_call(domain, service, data, blocking=True, context=context), "SunnyHome service call", eager_start=True
+            self.hass.services.async_call(domain, service, data, blocking=True, context=context) if len(calls) == 1 else run(),
+            "SunnyHome service call", eager_start=True
         )
         # async_call raises these before the service runs, so the eager start has already finished the task:
         # nothing was switched (failed). Any later error, ServiceValidationError included, ends unknown.
@@ -766,10 +1003,11 @@ class CommandRunner:
         """(status, JSON of a 200 answer). Never logs the token or the commands."""
         # AUTO-004: a claim announces lease support (a capability, not authority; an older SunnyHome ignores the header).
         headers = {**self.headers, "X-SunnyHome-Leases": "1"} if path == "claim" else self.headers
+        if path == "claim":  # RA-004: from 0.6.0 SunnyHome also sends no_discharge (mode 7); HA-014: from 0.16.0 heat commands; WALLBOX-005: from 0.17.0 set_current; so on every claim
+            headers["X-SunnyHome-Component"] = VERSION
         if path == "claim" and self.entry.options.get(CONF_INVERTER):  # BAT-008: inverter commands only while the option is on
             headers["X-SunnyHome-Inverter"] = "1"
-            headers["X-SunnyHome-Component"] = VERSION  # RA-004: from 0.6.0 SunnyHome also sends no_discharge (mode 7)
-        if path == "claim" and self.entry.options.get(CONF_WALLBOX):  # EV-004: wallbox commands only while the option is on
+        if path == "claim" and (self.entry.options.get(CONF_WALLBOX) or self.entry.options.get(CONF_OTHER_WALLBOX)):  # EV-004, WALLBOX-005: wallbox commands only while an option is on
             headers["X-SunnyHome-Wallbox"] = "1"
         try:
             async with async_get_clientsession(self.hass).post(

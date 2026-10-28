@@ -37,15 +37,21 @@
     "step": {
       "init": {
         "title": "Devices shared with SunnyHome",
-        "description": "Only the ticked switches and lights are shared with SunnyHome: their name, state and brightness. SolaX Modbus entities are never offered.\n\n**Control:** SunnyHome can switch on and off, and dim, the devices ticked under \"Devices SunnyHome may control\" once control is also allowed for this connection in SunnyHome. Never tick a switch of an inverter, battery or EV charger there.\n\n**Sensors:** SunnyHome receives the value, unit and time of the temperature, power and energy sensors ticked under \"Sensors SunnyHome may read\", for its automation rules.",
+        "description": "Only the ticked switches and lights are shared with SunnyHome: their name, state and brightness. SolaX Modbus entities are never offered.\n\n**Control:** SunnyHome can switch on and off, and dim, the devices ticked under \"Devices SunnyHome may control\" once control is also allowed for this connection in SunnyHome. Heating and hot water entities ticked above can be ticked here too. Never tick a switch of an inverter, battery or EV charger there.\n\n**Sensors:** SunnyHome receives the value, unit and time of the temperature, power, energy, battery, voltage, current, humidity, gas and water sensors ticked under \"Sensors SunnyHome may read\", for its automation rules and the Device widget.\n\n**Binary sensors and people:** SunnyHome receives only the on or off state of the door, window, garage door, opening, motion and occupancy sensors ticked under \"Binary sensors SunnyHome may see\", and only home or away for the people ticked under \"People SunnyHome may see\". It never receives a person's zone, place name, coordinates or device trackers. They are read only and shown on the Device widget; SunnyHome never controls them.\n\n**Heating and hot water:** SunnyHome receives only the mode, current and target temperature, allowed temperature range and available modes of the heat pumps, thermostats and water heaters ticked under \"Heating and hot water SunnyHome may read\", and whether a thermostat is heating or cooling. Nothing else of them is sent. They are shown on the Device widget. SunnyHome sets a target temperature or mode only for the ones also ticked under \"Devices SunnyHome may control\", and only once control is allowed for this connection in SunnyHome. For a change made by an automation rule, Home Assistant puts the previous target and mode back when the rule stops renewing it, but only if nobody changed them by hand meanwhile. A thermostat with a low and a high target only is never controlled.",
         "data": {
           "entities": "Shared devices",
           "control": "Devices SunnyHome may control",
-          "sensors": "Sensors SunnyHome may read"
+          "sensors": "Sensors SunnyHome may read",
+          "binary_sensors": "Binary sensors SunnyHome may see",
+          "people": "People SunnyHome may see",
+          "heat": "Heating and hot water SunnyHome may read"
         },
         "data_description": {
-          "control": "Each must also be ticked under Shared devices. Leave empty and SunnyHome controls nothing.",
-          "sensors": "At most 32. Leave empty and SunnyHome reads no sensors."
+          "control": "Each must also be ticked under Shared devices or Heating and hot water. Leave empty and SunnyHome controls nothing.",
+          "sensors": "At most 32. Leave empty and SunnyHome reads no sensors.",
+          "binary_sensors": "Door, window, garage door, opening, motion and occupancy sensors: on or off only. Together with the shared devices, people and heating at most 64. Leave empty and SunnyHome sees none.",
+          "people": "Only home or away is sent, never where the person is. Together with the shared devices, binary sensors and heating at most 64. Leave empty and SunnyHome sees no one.",
+          "heat": "Climate entities (heat pumps, thermostats) and water heaters (boilers): only the mode and temperatures. Together with the shared devices, binary sensors and people at most 64. Leave empty and SunnyHome reads none."
         }
       },
       "inverter": {
@@ -61,12 +67,35 @@
         "data": {
           "wallbox_control": "Allow SunnyHome to set the EV charger's work mode"
         }
+      },
+      "other_wallbox": {
+        "title": "Other wallbox",
+        "description": "Optional: share another EV charger that Home Assistant already shows (for example an Easee, Zaptec, Wallbox or OCPP charger), so SunnyHome can show its charging power and session energy.\n\n**What is shared:** the state and unit of the power sensor, of the optional session energy sensor and status sensor, and the state of the charging current number (its set point in amps, and its minimum and maximum). SunnyHome reads nothing else of the charger. Choose the power sensor and the charging current number together, or leave both empty if you have no other wallbox.\n\n**Warning: control lets SunnyHome set this charger's charging current.** When control is on and you also allow EV charging control in SunnyHome, its wallbox rules may set the charging current number between 6 A and the number's maximum (at most 32 A): FAST uses the maximum, ECO 6 A, and STOP switches the charger off with the switch you chose (without a switch, only a number that accepts 0 A is set to 0). SunnyHome never starts or ends a charging session itself. Nothing is sent until a physical check has verified your charger model.\n\nHome Assistant puts the previous current and switch state back when SunnyHome stops renewing a setting (within 30 minutes), also after a restart, but only if you did not change them by hand meanwhile. If Home Assistant itself is down, the charger keeps its setting. Turning control off puts the previous values back at once.",
+        "data": {
+          "other_wallbox_power": "Power sensor",
+          "other_wallbox_current": "Charging current number (A)",
+          "other_wallbox_switch": "Charger switch (optional)",
+          "other_wallbox_energy": "Session energy sensor (optional)",
+          "other_wallbox_status": "Status sensor (optional)",
+          "other_wallbox_control": "Allow SunnyHome to set this charger's charging current"
+        },
+        "data_description": {
+          "other_wallbox_power": "The charger's charging power (a power sensor, in W or kW). Required together with the charging current number.",
+          "other_wallbox_current": "The number that sets the charging current in amps, with its own minimum and maximum. Required together with the power sensor.",
+          "other_wallbox_switch": "Switches the charging on and off. With it, STOP switches it off; without it, STOP needs a number that accepts 0 A.",
+          "other_wallbox_energy": "The energy of the current charging session (an energy sensor, in kWh or Wh). Leave empty if the charger has none.",
+          "other_wallbox_status": "A text such as Charging or Disconnected; only short plain text is sent. Leave empty if the charger has none.",
+          "other_wallbox_control": "Off by default. Read the warning above; SunnyHome also needs EV charging control allowed in SunnyHome."
+        }
       }
     },
     "error": {
-      "too_many": "Choose at most 64 devices.",
-      "control_not_shared": "Devices SunnyHome may control must also be ticked as shared devices.",
-      "too_many_sensors": "Choose at most 32 sensors."
+      "too_many": "Choose at most 64 devices, binary sensors, people and heating entities together.",
+      "control_not_shared": "Devices SunnyHome may control must also be ticked as shared devices or as heating and hot water.",
+      "too_many_sensors": "Choose at most 32 sensors.",
+      "needs_both": "Choose both the power sensor and the charging current number, or leave both empty.",
+      "number_unit": "The charging current number must be in amperes (A).",
+      "number_range": "The charging current number needs a minimum and a maximum that allow some current between 6 A and 32 A."
     }
   },
   "issues": {

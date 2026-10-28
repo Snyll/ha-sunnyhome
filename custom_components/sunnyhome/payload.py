@@ -161,12 +161,26 @@ MAX_NAME = 64
 STATES = frozenset({"on", "off", "unavailable", "unknown"})
 # The server's entity id rule; one entity outside it would make the server refuse the whole post.
 _ENTITY_ID = re.compile(r"(switch|light)\.[a-z0-9_]{1,200}")
+# HA-012 (0.14.0): picked binary sensors and people ride in the same "entities" list (kind "binary" / "person"), read only and never in the
+# command or lease rules above. The id bound keeps the whole id within the server's 207 characters ("binary_sensor." is 14).
+BINARY_CLASSES = frozenset({"door", "window", "garage_door", "opening", "motion", "occupancy"})
+# HA-013 (0.15.0): picked heat pumps and boilers (climate, water_heater) ride there too (kind = the domain, plus a "heat" object), read only; "climate." is 8
+# characters and "water_heater." 13, so their ids stop at 199 and 194. Everything in "heat" is sanitised here, because one item the server refuses refuses the post.
+HEAT_DOMAINS = frozenset({"climate", "water_heater"})
+MAX_HEAT_TEXT = 32  # a mode, an action or the state (UTF-16 code units, like the server)
+MAX_HEAT_MODES = 8
+HEAT_LIMIT = 1000  # a number beyond it is not a temperature
+# HA-014 (0.16.0): the heat entities a command may name (the same id bounds as the readings above).
+_HEAT_ENTITY = re.compile(r"climate\.[a-z0-9_]{1,199}|water_heater\.[a-z0-9_]{1,194}")
+_STATE_ID = re.compile(r"(switch|light)\.[a-z0-9_]{1,200}|binary_sensor\.[a-z0-9_]{1,193}|person\.[a-z0-9_]{1,200}"
+                       r"|climate\.[a-z0-9_]{1,199}|water_heater\.[a-z0-9_]{1,194}")
 # HA-005: picked sensors. The server's rules again (one item outside them refuses the whole post): the id within the rule bound
-# (64 characters), these device classes, at most 32, state and unit lengths counted like the server (UTF-16 code units).
+# (64 characters), these device classes (HA-011: battery, voltage, current, humidity, gas and water added; gas and water are meter totals like
+# energy), at most 32, state and unit lengths counted like the server (UTF-16 code units).
 MAX_SENSORS = 32
 MAX_STATE = 64
 MAX_UNIT = 16
-SENSOR_CLASSES = frozenset({"temperature", "power", "energy"})
+SENSOR_CLASSES = frozenset({"temperature", "power", "energy", "battery", "voltage", "current", "humidity", "gas", "water"})
 SENSOR_ID = re.compile(r"sensor\.[a-z0-9_]{1,57}")
 LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "host.docker.internal"})
 # ISET-004 (0.5.0): the inverter settings of the hub, read only. Which entities count is the mapping profile's business: the
@@ -218,7 +232,7 @@ def _iso(moment: datetime) -> str:
 
 
 class Entity(NamedTuple):
-    """A shared switch or light, as read from the HA state machine."""
+    """A shared switch or light, as read from the HA state machine. HA-012: also a binary sensor (with its device class) or a person."""
 
     entity_id: str
     name: str | None
@@ -226,6 +240,9 @@ class Entity(NamedTuple):
     brightness: int | None  # HA scale 0-255
     supports_brightness: bool
     last_changed: datetime | None
+    device_class: str | None = None  # HA-012: a binary sensor's class
+    attributes: Mapping | None = None  # HA-013: a climate's or water heater's state attributes (read by heat(), nothing else leaves)
+    unit: str | None = None  # HA-013: the temperature unit of the HA instance (hass.config.units.temperature_unit); climate entities carry none
 
 
 def _name(name: str | None, entity_id: str) -> str:
@@ -234,8 +251,85 @@ def _name(name: str | None, entity_id: str) -> str:
     return ((name if name.isprintable() else "") or entity_id)[:MAX_NAME].rstrip()
 
 
+def _person_state(state: str) -> str:
+    """HA-012: a person is home or away, nothing else: a zone name is away, so no place name leaves Home Assistant."""
+    return state if state in ("home", "unavailable", "unknown") else "away"
+
+
+def _heat_number(value: object) -> float | None:
+    """HA-013: a finite number of at most HEAT_LIMIT in size; a bool, text, NaN or infinity is not a reading (null, shown as a dash, never zero)."""
+    # The size test comes first: math.isfinite overflows on a huge int.
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or abs(value) > HEAT_LIMIT or not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def _heat_text(value: object) -> str | None:
+    """HA-013: printable text of 1-MAX_HEAT_TEXT characters (a mode, an action), else None."""
+    return value if isinstance(value, str) and value and value.isprintable() and _utf16(value) <= MAX_HEAT_TEXT else None
+
+
+def heat(domain: str, state: str, attributes: Mapping | None, unit: str | None) -> dict:
+    """HA-013: the "heat" object of a climate or water_heater: current and target temperature, the target range and step, the mode (the state,
+    which is hvac_mode or the operation mode), the available modes (at most MAX_HEAT_MODES), a climate's hvac_action and the unit. Sanitised so the
+    server never refuses it: a bad number is None, a range with min > max loses both ends, a step <= 0 is the default (0.5 for °C, 1 for °F), a
+    mode that is not printable text of at most 32 characters is dropped. An unavailable or unknown entity reports no values at all. A dual setpoint
+    (target_temp_low and target_temp_high without a temperature) has no target here and stays read only (HA-014)."""
+    live = state not in ("unavailable", "unknown")
+    attributes = attributes if live and attributes else {}
+    unit = unit if unit in ("°C", "°F") else "°C"
+    low, high = _heat_number(attributes.get("min_temp")), _heat_number(attributes.get("max_temp"))
+    if low is not None and high is not None and low > high:
+        low = high = None
+    step = _heat_number(attributes.get("target_temp_step"))
+    listed = attributes.get("hvac_modes" if domain == "climate" else "operation_list")
+    modes = [m for m in listed if _heat_text(m)][:MAX_HEAT_MODES] if isinstance(listed, (list, tuple)) else []
+    mode = _heat_text(state if domain == "climate" else attributes.get("operation_mode", state)) if live else None
+    return {
+        "current": _heat_number(attributes.get("current_temperature")),
+        "target": _heat_number(attributes.get("temperature")),
+        "min": low, "max": high, "step": step if step is not None and step > 0 else 0.5 if unit == "°C" else 1.0,
+        "mode": mode, "modes": modes,
+        "action": _heat_text(attributes.get("hvac_action")) if domain == "climate" else None,
+        "unit": unit,
+    }
+
+
 def _entity(e: Entity, control: Collection[str]) -> dict:
     domain = e.entity_id.split(".", 1)[0]
+    if domain in HEAT_DOMAINS:  # HA-013: read only like a binary sensor; lastChanged is the reading's own time (last_reported), see Pusher.entities
+        state = e.state if _heat_text(e.state) else "unknown"
+        item = {
+            "entityId": e.entity_id,
+            "domain": domain,
+            "name": _name(e.name, e.entity_id),
+            "state": state,
+            "brightness": None,
+            "supportsBrightness": False,
+            "lastChanged": _iso(e.last_changed) if e.last_changed else None,
+            "kind": domain,
+            "heat": heat(domain, state, e.attributes, e.unit),
+        }
+        if control:  # HA-014: the component decides it (the control tick and TARGET_TEMPERATURE), see controllable()
+            item["controllable"] = e.entity_id in control
+        return item
+    if domain in ("binary_sensor", "person"):  # HA-012: read only; a person has no timing (a zone move would leak it) and no attribute
+        person = domain == "person"
+        item = {
+            "entityId": e.entity_id,
+            "domain": domain,
+            "name": _name(e.name, e.entity_id),
+            "state": _person_state(e.state) if person else e.state if e.state in STATES else "unknown",
+            "brightness": None,
+            "supportsBrightness": False,
+            "lastChanged": None if person or not e.last_changed else _iso(e.last_changed),
+            "kind": "person" if person else "binary",
+        }
+        if not person:
+            item["deviceClass"] = e.device_class
+        if control:
+            item["controllable"] = False
+        return item
     supports = domain == "light" and e.supports_brightness
     state = e.state if e.state in STATES else "unknown"
     level = e.brightness if supports and state == "on" and isinstance(e.brightness, (int, float)) else None
@@ -334,6 +428,7 @@ def build(
     integration: str = "solax_modbus",
     hub_info: dict | None = None,
     wallbox: dict | None = None,
+    wallboxes: list[dict] | None = None,
 ) -> dict:
     """Body of POST /api/ha/v1/states.
 
@@ -347,6 +442,7 @@ def build(
     hub_settings is the hub's settings object (ISET-004, see settings()), sent beside the readings.
     hub_info is the hub's plugin and manufacturer (HA-008, see hub()), sent beside the readings of a solax_modbus hub.
     wallbox is the EV-charger hub's envelope (EV-004, see wallbox_report()), sent beside either inverter key.
+    wallboxes is the list of the Other wallbox item (WALLBOX-005, see generic_report()), sent beside "wallbox".
     """
     solax = None if readings is None else {
         "serial": serial,
@@ -355,7 +451,8 @@ def build(
             for key, unit, state, reported in readings[:MAX_READINGS]
         ],
     }
-    items = [_entity(e, control) for e in entities if _ENTITY_ID.fullmatch(e.entity_id)]
+    items = [_entity(e, control) for e in entities if _STATE_ID.fullmatch(e.entity_id)
+             and (e.device_class in BINARY_CLASSES or not e.entity_id.startswith("binary_sensor."))]
     if solax is not None and integration != "solax_modbus":
         body = {"sentAt": _iso(sent_at), "inverter": {"integration": integration, **solax}, "entities": items[:MAX_ENTITIES]}
     else:
@@ -370,6 +467,8 @@ def build(
         body["sensors"] = _sensors(sensors)
     if wallbox is not None:  # EV-004: only with an EV-charger hub (a backend before EV-004 refuses a solax_modbus wallbox)
         body["wallbox"] = wallbox
+    if wallboxes is not None:  # WALLBOX-005: only with an Other wallbox set up (a backend before it refuses the key)
+        body["wallboxes"] = wallboxes
     return body
 
 
@@ -383,6 +482,12 @@ POLL_S = 0.2
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _COMMAND_KEYS = frozenset({"id", "entityId", "action", "level", "ttlMs"})
 _LEASED_KEYS = _COMMAND_KEYS | {"leaseS"}
+# HA-014: a command on a heat entity, whatever its action, has this shape; value and mode are null where the action has none.
+_HEAT_KEYS = _COMMAND_KEYS | {"value", "mode"}
+_HEAT_LEASED_KEYS = _HEAT_KEYS | {"leaseS"}
+HEAT_ACTIONS = ("set_temperature", "set_mode")
+HEAT_RESTORE_GIVE_UP_S = 3600  # a restore not confirmed within an hour of the lease end is given up (a try puts back only what still shows the lease's value)
+_UNAVAILABLE = ("unavailable", "unknown")
 LEASE_MIN_S, LEASE_MAX_S = 60, 3600
 _LOGGER = logging.getLogger(__name__)
 
@@ -394,6 +499,8 @@ class Command(NamedTuple):
     level: int | None  # 1-100 for level, else None
     ttl_ms: int
     lease_s: int | None = None  # AUTO-004: the lease of an automation on/level, or the renewal's length
+    value: float | None = None  # HA-014: set_temperature's target (a restore: the previous target to put back)
+    mode: str | None = None  # HA-014: set_mode's mode, or set_temperature's optional mode (a restore: the previous mode)
 
 
 class Seen(NamedTuple):
@@ -403,6 +510,7 @@ class Seen(NamedTuple):
     brightness: int | float | None  # HA scale 0-255
     dimmable: bool
     assumed: bool
+    heat: dict | None = None  # HA-014: heat() of a climate or water heater (target, mode, min, max, step, modes), as the component reports it
 
 
 class Env(NamedTuple):
@@ -416,8 +524,13 @@ class Env(NamedTuple):
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], Awaitable] = asyncio.sleep
     leases: Leases | None = None  # AUTO-004: the entry's leases (None: an executor without leases)
+    dispatch_many: Callable[[list], asyncio.Future] | None = None  # HA-014: several service calls in one task and one context (None: chained over dispatch)
     save: Callable[[], Awaitable] | None = None  # persists the leases; awaited before a leased service call
     wall: Callable[[], float] = time.time  # the lease clock (UTC seconds), persisted across restarts
+
+
+def is_heat(entity_id: object) -> bool:
+    return isinstance(entity_id, str) and _HEAT_ENTITY.fullmatch(entity_id) is not None
 
 
 def parse_command(item: object) -> tuple[str | None, Command | None]:
@@ -426,6 +539,17 @@ def parse_command(item: object) -> tuple[str | None, Command | None]:
         return None, None
     entity_id, action, level, ttl, lease = (item.get(key) for key in ("entityId", "action", "level", "ttlMs", "leaseS"))
     leasing = type(lease) is int and LEASE_MIN_S <= lease <= LEASE_MAX_S
+    if is_heat(entity_id):  # HA-014: set_temperature (a lease and a mode are optional), set_mode and the lease renewal and cancel; never on, off or level
+        value, mode = item.get("value"), item.get("mode")
+        valid = (
+            item.keys() in (_HEAT_KEYS, _HEAT_LEASED_KEYS) and level is None and type(ttl) is int and ttl >= 0
+            and (action == "set_temperature" and _heat_number(value) is not None and (mode is None or _heat_text(mode) is not None) and (lease is None or leasing)
+                 or action == "set_mode" and value is None and _heat_text(mode) is not None and lease is None
+                 or action == "lease_renew" and value is None and mode is None and leasing
+                 or action == "lease_cancel" and value is None and mode is None and lease is None)
+        )
+        value = _heat_number(value) if action == "set_temperature" else None
+        return cid, (Command(cid, entity_id, action, None, ttl, lease, value, mode) if valid else None)
     valid = (
         item.keys() in (_COMMAND_KEYS, _LEASED_KEYS)
         and isinstance(entity_id, str) and _ENTITY_ID.fullmatch(entity_id) is not None
@@ -451,14 +575,83 @@ def service_call(cmd: Command) -> tuple[str, str, dict]:
     return domain, "turn_off" if cmd.action == "off" else "turn_on", data
 
 
+def _near(shown: object, want: float, step: object) -> bool:
+    """A target within what the entity can show: half a step (integrations round to their precision), at least 0.05."""
+    return isinstance(shown, (int, float)) and abs(shown - want) <= max((step if isinstance(step, (int, float)) and step > 0 else 0.5) / 2, 0.05)
+
+
+def _shows(key: str, want: object, heat: dict) -> bool:
+    return heat.get("mode") == want if key == "mode" else _near(heat.get("target"), want, heat.get("step"))
+
+
+def heat_shows(spec: dict | None, seen: Seen | None) -> bool:
+    """HA-014: whether the entity shows every value the spec holds ({"temperature", "mode"}; a None key is not held)."""
+    if seen is None or seen.heat is None or spec is None:
+        return False
+    return all(_shows(key, want, seen.heat) for key, want in spec.items() if want is not None)
+
+
+def _final_mode(cmd: Command, seen: Seen | None) -> str | None:
+    return cmd.mode if cmd.mode is not None else seen.heat.get("mode") if seen is not None and seen.heat is not None else None
+
+
+def service_calls(cmd: Command, seen: Seen | None) -> list[tuple[str, str, dict]]:
+    """The service calls of one command: one for a switch or light; for a heat entity the mode first (not when it is already shown), then the
+    temperature (not when the resulting mode is off: many integrations refuse a setpoint then). An empty list: nothing to call."""
+    if not is_heat(cmd.entity_id):
+        return [service_call(cmd)]
+    domain = cmd.entity_id.split(".", 1)[0]
+    data = {"entity_id": cmd.entity_id}
+    calls = []
+    if cmd.mode is not None and cmd.mode != (seen.heat.get("mode") if seen is not None and seen.heat is not None else None):
+        calls.append((domain, "set_hvac_mode" if domain == "climate" else "set_operation_mode",
+                      {**data, "hvac_mode" if domain == "climate" else "operation_mode": cmd.mode}))
+    if cmd.value is not None and _final_mode(cmd, seen) != "off":
+        calls.append((domain, "set_temperature", {**data, "temperature": cmd.value}))
+    return calls
+
+
+def _chain(dispatch: Callable, calls: list) -> asyncio.Future:
+    """Several calls in one task over a plain dispatch: the first starts at once (it may raise), the rest follow only if it did not."""
+    first = dispatch(*calls[0])
+
+    async def rest() -> None:
+        await first
+        for call in calls[1:]:
+            await dispatch(*call)
+    return asyncio.ensure_future(rest())
+
+
+def in_range(value: float, heat: dict) -> bool:
+    """HA-014: within the entity's own min and max (both known) and on its step grid (value / step whole, or exactly min or max)."""
+    low, high, step = heat.get("min"), heat.get("max"), heat.get("step")
+    if low is None or high is None or not isinstance(step, (int, float)) or step <= 0:
+        return False
+    cells = value / step
+    return low - 1e-9 <= value <= high + 1e-9 and (abs(cells - round(cells)) <= 1e-6 or abs(value - low) <= 1e-9 or abs(value - high) <= 1e-9)
+
+
 def reached(cmd: Command, seen: Seen | None) -> bool:
-    """The target state: on or off; for a level on with the brightness within 1 %."""
+    """The target state: on or off; for a level on with the brightness within 1 %; HA-014: the target and mode of a heat command."""
     if seen is None:
         return False
+    if is_heat(cmd.entity_id):
+        return heat_shows({"temperature": cmd.value if _final_mode(cmd, seen) != "off" else None, "mode": cmd.mode}, seen)
     if cmd.action != "level":
         return seen.state == cmd.action
     b = seen.brightness
     return seen.state == "on" and isinstance(b, (int, float)) and abs(round(b * 100 / 255) - cmd.level) <= 1
+
+
+async def _wait_inflight(eid: str, env: Env) -> tuple[str, str | None, bool] | None:
+    """A command waits for the entity's previous service call (never cancelled); None when it ended, else the refusal."""
+    if prior := env.inflight.get(eid):
+        task, started = prior
+        while not task.done():
+            if env.clock() >= started + BUSY_S:
+                return "failed", "entity_busy", False
+            await env.sleep(POLL_S)
+    return None
 
 
 async def execute(cmd: Command, until: float, env: Env) -> tuple[str, str | None, bool]:
@@ -469,47 +662,66 @@ async def execute(cmd: Command, until: float, env: Env) -> tuple[str, str | None
     "failed" only when nothing was dispatched; after dispatch only "done" (target observed) or "unknown".
     AUTO-004: a leased on/level records its lease (saved) before its checks and drops it again when refused;
     every other command for the entity ends the entity's lease; lease_renew and lease_cancel call no service.
+    HA-014: a leased set_temperature records a restore lease (the previous target and mode, read first, and the values it sets).
     """
     eid = cmd.entity_id
     async with env.locks.setdefault(eid, asyncio.Lock()):
-        if prior := env.inflight.get(eid):
-            task, started = prior
-            while not task.done():
-                if env.clock() >= started + BUSY_S:
-                    return "failed", "entity_busy", False
-                await env.sleep(POLL_S)
+        if busy := await _wait_inflight(eid, env):
+            return busy
         if cmd.action in ("lease_renew", "lease_cancel"):
             return await _lease_command(cmd, until, env)
         leased = cmd.lease_s is not None and env.leases is not None
+        before = env.leases.items.get(eid) if env.leases is not None else None
         if env.leases is not None:
             if leased:
-                env.leases.grant(eid, cmd.id, cmd.lease_s, cmd.action, cmd.level, env.wall())
-                await env.save()  # saved before the call: a crash right after it never leaves an on without its lease
+                if is_heat(eid):
+                    # The previous values are read before anything is written; an entity that shows none gets no lease (and is refused below).
+                    if (seen := env.state(eid)) is not None and seen.heat is not None and seen.state not in _UNAVAILABLE:
+                        env.leases.grant_restore(eid, cmd, seen, env.wall())
+                        await env.save()
+                else:
+                    env.leases.grant(eid, cmd.id, cmd.lease_s, cmd.action, cmd.level, env.wall())
+                    await env.save()  # saved before the call: a crash right after it never leaves an on without its lease
             elif env.leases.cancel(eid) is not None:
                 await env.save()
         # No await from here to the dispatch: the checks hold when the call starts.
         refusal = _refusal(cmd, until, env)
+        task = None
         if refusal is None:
             try:
-                task = env.dispatch(*service_call(cmd))
+                calls = service_calls(cmd, env.state(eid))
+                if len(calls) == 1:
+                    task = env.dispatch(*calls[0])
+                elif calls:
+                    task = (env.dispatch_many or partial(_chain, env.dispatch))(calls)
             except Exception as err:  # raised before the service ran, so nothing was switched
                 _LOGGER.debug("Service call refused: %s", type(err).__name__)
                 refusal = "service_error"
         if refusal is not None:
             if leased:
-                env.leases.cancel(eid)
+                if before is not None and is_heat(eid):
+                    env.leases.items[eid] = before  # the earlier restore lease still holds the real previous values
+                else:
+                    env.leases.cancel(eid)
                 await env.save()
             return "failed", refusal, False
+        return await _watch(cmd, task, env)
+
+
+async def _watch(cmd: Command, task: asyncio.Future | None, env: Env) -> tuple[str, str | None, bool]:
+    """After the dispatch: "done" once the target shows (within WATCH_S), else "unknown"; task None: nothing was to be called."""
+    eid = cmd.entity_id
+    if task is not None:
         env.inflight[eid] = (task, env.clock())
         task.add_done_callback(partial(_finished, env.inflight, eid))
-        end = env.clock() + WATCH_S
-        while not (task.done() and (task.cancelled() or task.exception() is not None)):
-            if reached(cmd, seen := env.state(eid)):
-                return "done", "assumed_state" if seen.assumed else None, seen.assumed
-            if env.clock() >= end:
-                return "unknown", "no_confirmation", False
-            await env.sleep(POLL_S)
-        return "unknown", "service_error", False  # the call failed after it started (e.g. ServiceValidationError)
+    end = env.clock() + WATCH_S
+    while task is None or not (task.done() and (task.cancelled() or task.exception() is not None)):
+        if reached(cmd, seen := env.state(eid)):
+            return "done", "assumed_state" if seen.assumed else None, seen.assumed
+        if env.clock() >= end:
+            return "unknown", "no_confirmation", False
+        await env.sleep(POLL_S)
+    return "unknown", "service_error", False  # the call failed after it started (e.g. ServiceValidationError)
 
 
 def _refusal(cmd: Command, until: float, env: Env) -> str | None:
@@ -520,17 +732,39 @@ def _refusal(cmd: Command, until: float, env: Env) -> str | None:
     if not env.allowed(eid):
         return "not_controllable"
     seen = env.state(eid)
-    if seen is None or seen.state in ("unavailable", "unknown"):
+    if seen is None or seen.state in _UNAVAILABLE:
         return "entity_unavailable"
+    if is_heat(eid) != (cmd.action in HEAT_ACTIONS or cmd.action == "restore"):
+        return "invalid_command"  # nothing but a target or a mode is ever sent to a heat entity (a climate has its own turn_on/turn_off)
+    if is_heat(eid):
+        if seen.heat is None:
+            return "entity_unavailable"
+        if cmd.action == "set_temperature" and not in_range(cmd.value, seen.heat):
+            return "out_of_range"
+        if cmd.mode is not None and cmd.mode not in seen.heat.get("modes", ()):
+            return "mode_unsupported"
+        if cmd.action == "set_temperature" and cmd.mode is None and _final_mode(cmd, seen) == "off":
+            return "mode_off"  # HA-014: no setpoint is sent in mode off (service_calls), so it would only look done; an explicit mode (even off) is the caller's choice
+        return None
     if cmd.action == "level" and not (eid.startswith("light.") and seen.dimmable):
         return "not_dimmable"
     return None
 
 
 async def _lease_command(cmd: Command, until: float, env: Env) -> tuple[str, str | None, bool]:
-    """AUTO-004: a renewal extends only an active lease whose entity is still at its target; a cancel ends the lease (done also when none)."""
+    """AUTO-004: a renewal extends only an active lease whose entity is still at its target; a cancel ends the lease (done also when none).
+    HA-014: a cancel of a restore lease puts the previous target and mode back first (the rule's condition ended); a restore that does not
+    complete leaves the lease due, so the lease check retries it."""
     if cmd.action == "lease_cancel":
-        if env.leases is not None and env.leases.cancel(cmd.entity_id) is not None:
+        lease = env.leases.items.get(cmd.entity_id) if env.leases is not None else None
+        if lease is not None and lease.target == "restore":
+            env.leases.items[cmd.entity_id] = lease._replace(until=min(lease.until, env.wall()))
+            await env.save()
+            outcome = await _restore_locked(cmd.entity_id, env.leases.items[cmd.entity_id], env)
+            if outcome[0] == "done" or outcome[1] in ("outside_change", "not_controllable"):
+                env.leases.cancel(cmd.entity_id)
+                await env.save()
+        elif env.leases is not None and env.leases.cancel(cmd.entity_id) is not None:
             await env.save()
         return "done", None, False
     if env.clock() >= until:
@@ -544,18 +778,93 @@ async def _lease_command(cmd: Command, until: float, env: Env) -> tuple[str, str
     return ("failed", reason, False) if reason else ("done", None, False)
 
 
+def heat_verdict(lease: "Lease", seen: Seen | None) -> tuple[str, Command | None]:
+    """HA-014: what a restore lease's end does, per key the lease changed. A key still at its set value is put back (to prev); at prev it
+    is done; at anything else someone changed it by hand. ("restore", cmd) | ("ended", None) | ("cancelled", None) (a key was changed by hand)."""
+    heat = seen.heat if seen is not None else None
+    if heat is None:
+        return "cancelled", None
+    back = {}
+    for key, want in lease.set.items():
+        if want is None:
+            continue
+        old = lease.prev.get(key)
+        if old is None:  # nothing to put back for this key
+            if not _shows(key, want, heat):
+                return "cancelled", None
+        elif _shows(key, old, heat):
+            continue
+        elif _shows(key, want, heat):
+            back[key] = old
+        else:
+            return "cancelled", None
+    if not back:
+        return "ended", None
+    return "restore", Command(lease.command, "", "restore", None, 0, None, back.get("temperature"), back.get("mode"))
+
+
+async def _restore_locked(eid: str, lease: "Lease", env: Env) -> tuple[str, str | None, bool]:
+    """The entity lock held: put a restore lease's previous values back where the entity still shows the lease's values."""
+    if not env.allowed(eid):
+        return "failed", "not_controllable", False
+    seen = env.state(eid)
+    if seen is None or seen.state in _UNAVAILABLE or seen.heat is None:
+        return "failed", "entity_unavailable", False
+    verdict, cmd = heat_verdict(lease, seen)
+    if verdict == "cancelled":
+        return "failed", "outside_change", False
+    if cmd is None:
+        return "done", None, False
+    cmd = cmd._replace(entity_id=eid)
+    calls = service_calls(cmd, seen)
+    task = None
+    try:
+        if len(calls) == 1:
+            task = env.dispatch(*calls[0])
+        elif calls:
+            task = (env.dispatch_many or partial(_chain, env.dispatch))(calls)
+    except Exception as err:  # raised before the service ran
+        _LOGGER.debug("Service call refused: %s", type(err).__name__)
+        return "failed", "service_error", False
+    return await _watch(cmd, task, env)
+
+
+async def restore(eid: str, lease: "Lease", env: Env) -> tuple[str, str | None, bool]:
+    """HA-014: the lease check's restore of a due restore lease; ("done", ...) also when nothing was left to put back."""
+    async with env.locks.setdefault(eid, asyncio.Lock()):
+        if busy := await _wait_inflight(eid, env):
+            return busy
+        if env.leases is not None and env.leases.items.get(eid) is not lease:  # PLAN-031 integration: cancelled or replaced while this check waited
+            return "failed", "lease_changed", False
+        return await _restore_locked(eid, lease, env)
+
+
 class Lease(NamedTuple):
     """One entity's lease: its end (UTC seconds), its newest grant or renew command, and the target it holds."""
 
     until: float
     command: str
-    target: str  # on or level
+    target: str  # on or level; HA-014: restore
     level: int | None
+    prev: dict | None = None  # restore: the values to put back, {"temperature", "mode"} (a key the lease does not change is None)
+    set: dict | None = None  # restore: the values the lease set, the same shape; the entity must still show them
 
 
 def at_target(lease: Lease, seen: Seen | None) -> bool:
-    """Whether the entity still shows the lease's target: on; for a level on with the brightness within 1 %."""
+    """Whether the entity still shows the lease's target: on; for a level on with the brightness within 1 %; a restore lease: what it set."""
+    if lease.target == "restore":
+        return heat_shows(lease.set, seen)
     return reached(Command(lease.command, "", lease.target, lease.level, 0), seen)
+
+
+def _spec(item: object) -> dict | None:
+    """A stored {"temperature", "mode"} of a restore lease, sanitised; None when it is not one."""
+    if not isinstance(item, dict) or item.keys() != {"temperature", "mode"}:
+        return None
+    temperature, mode = item["temperature"], item["mode"]
+    if temperature is not None and _heat_number(temperature) is None or mode is not None and _heat_text(mode) is None:
+        return None
+    return {"temperature": None if temperature is None else float(temperature), "mode": mode}
 
 
 class Leases:
@@ -565,14 +874,36 @@ class Leases:
         self.items: dict[str, Lease] = {}
         for eid, item in (data or {}).items():
             try:
-                lease = Lease(float(item["until"]), str(item["command"]), item["target"], item.get("level"))
-            except (KeyError, TypeError, ValueError):
+                lease = Lease(float(item["until"]), str(item["command"]), item["target"], item.get("level"), _spec(item.get("prev")), _spec(item.get("set")))
+            except (KeyError, TypeError, ValueError, AttributeError):
                 continue  # a damaged entry is dropped, never guessed
+            if not isinstance(eid, str):
+                continue
             if _ENTITY_ID.fullmatch(eid) and lease.target in ("on", "level"):
+                self.items[eid] = lease
+            elif (_HEAT_ENTITY.fullmatch(eid) and lease.target == "restore" and lease.prev is not None and lease.set is not None
+                  and any(want is not None for want in lease.set.values())):
                 self.items[eid] = lease
 
     def grant(self, eid: str, command: str, seconds: int, target: str, level: int | None, now: float) -> None:
         self.items[eid] = Lease(now + seconds, command, target, level)
+
+    def grant_restore(self, eid: str, cmd: Command, seen: Seen, now: float) -> None:
+        """HA-014: the lease of a leased set_temperature: it sets cmd's values (no temperature when the resulting mode is off) and keeps what
+        the entity shows now as the values to put back. A lease already holding (the entity still shows what it set) keeps its own previous
+        values: a rule changing its mind must never record the already-raised values as the previous ones."""
+        heat = seen.heat
+        temperature = cmd.value if cmd.value is not None and _final_mode(cmd, seen) != "off" else None
+        new_set = {"temperature": temperature, "mode": cmd.mode}
+        new_prev = {"temperature": heat.get("target") if temperature is not None else None, "mode": heat.get("mode") if cmd.mode is not None else None}
+        old = self.items.get(eid)
+        if old is not None and old.target == "restore" and heat_shows(old.set, seen):
+            for key, held in old.set.items():
+                if held is not None:
+                    new_prev[key] = old.prev[key]
+                    if new_set[key] is None:
+                        new_set[key] = held
+        self.items[eid] = Lease(now + cmd.lease_s, cmd.id, "restore", None, new_prev, new_set)
 
     def renew(self, eid: str, command: str, seconds: int, seen: Seen | None, now: float) -> str | None:
         """None when extended; else the failure reason (no lease, it ended, or the entity left its target)."""
@@ -581,7 +912,7 @@ class Leases:
             return "lease_cancelled"
         if lease.until <= now:
             return "lease_ended"
-        if seen is None or seen.state in ("unavailable", "unknown"):
+        if seen is None or seen.state in _UNAVAILABLE:
             return "entity_unavailable"  # momentarily gone: the lease stays and keeps running
         if not at_target(lease, seen):
             del self.items[eid]
@@ -596,7 +927,8 @@ class Leases:
         return [(eid, lease) for eid, lease in self.items.items() if lease.until <= now]
 
     def to_dict(self) -> dict:
-        return {eid: lease._asdict() for eid, lease in self.items.items()}
+        # an on/level lease keeps its 0.15 shape (no prev/set), so a downgrade reads it as before
+        return {eid: {k: v for k, v in lease._asdict().items() if lease.target == "restore" or k not in ("prev", "set")} for eid, lease in self.items.items()}
 
 
 def _finished(inflight: dict, eid: str, task: asyncio.Future) -> None:
@@ -1142,3 +1474,393 @@ class Wallbox:
                     await self._call(gear, GEAR_6A)
                 if await self._call(charger.mode, WALLBOX_OPTIONS[lease.normal]):
                     self.echoes[charger.mode] = self._shown(charger.mode)[1]
+
+
+# WALLBOX-005 (0.17.0, docs/reviews/WALLBOX-005.md): another wallbox, any charger Home Assistant already shows. The user picks its power sensor and the
+# number that sets its charging current (A), optionally a switch, a session energy sensor and a status sensor. They are posted as "wallboxes"
+# beside the SolaX EV path; with the Other wallbox control option on SunnyHome may set the current (set_current) under a stored restore lease
+# (payload.GenericWallbox): the number's and the switch's previous values are put back at the lease end, only where they still show what the lease set.
+GENERIC_READING_KEYS = ("power", "energy", "current", "status")
+MAX_GENERIC_READINGS = 8  # the server's bound
+GENERIC_MIN_A, GENERIC_MAX_A = 6, 32  # the effective range is the number's own min and max cut to these
+GENERIC_NEAR_A = 0.5  # a charger shows a written current within half an ampere (integrations round to their step)
+GENERIC_CONFIRM_S = WALLBOX_SCAN_MAX_S + WALLBOX_CONFIRM_MARGIN_S  # how long a real poll of a written entity is awaited
+_STATUS = re.compile(r"[A-Za-z0-9 _.-]{1,32}")
+_PLATFORM = re.compile(r"[a-z0-9_]{1,40}")
+_GENERIC_COMMAND_KEYS = frozenset({"id", "wallbox", "mode", "amps", "durationS", "renew", "ttlMs"})
+_GENERIC_REQUIRED = frozenset({"id", "wallbox", "mode", "amps", "ttlMs"})  # a restore sends amps null and no duration or renew
+
+
+class OtherWallbox(NamedTuple):
+    """The entity ids the user picked in the Other wallbox options step (power and number are required, the rest may be None)."""
+
+    number: str
+    switch: str | None
+    power: str
+    energy: str | None
+    status: str | None
+
+
+class GenericConfig(NamedTuple):
+    """The number's resolved range: min_a and max_a are None while its own min and max are not usable (range_invalid)."""
+
+    number: str
+    switch: str | None
+    min_a: float | None
+    max_a: float | None
+    allows_zero: bool  # the number's own min is 0, so a switch-less STOP may write 0
+
+
+def generic_range(low: object, high: object) -> tuple[float, float, bool] | None:
+    """The effective range from the number entity's min and max attributes: cut to 6..32 A; (min, max, own min is 0) or None when an
+    attribute is no finite number or nothing is left of the range."""
+    own_low, own_high = _heat_number(low), _heat_number(high)
+    if own_low is None or own_high is None:
+        return None
+    start, end = max(own_low, GENERIC_MIN_A), min(own_high, GENERIC_MAX_A)
+    return (start, end, own_low <= 0) if start <= end else None
+
+
+def other_wallbox_error(power: str | None, current: str | None, attrs: Mapping | None) -> tuple[str, str] | None:
+    """The options step's check: None when both required entities are empty (no other wallbox) or valid; else (field, error code), with field
+    power or current: needs_both when only one is set, number_unit when the number is not in A, number_range when it has no usable min and max
+    (attrs are the number's state attributes, None when it is not in the state machine)."""
+    if not power and not current:
+        return None
+    if not power or not current:
+        return ("power" if not power else "current", "needs_both")
+    attrs = attrs or {}
+    if attrs.get("unit_of_measurement") != "A":
+        return "current", "number_unit"
+    return None if generic_range(attrs.get("min"), attrs.get("max")) else ("current", "number_range")
+
+
+def _amp(value: float) -> float | int:
+    return int(value) if float(value).is_integer() else round(value, 1)
+
+
+def generic_control(option: bool, present: bool, rng: tuple[float, float, bool] | None, platform: object, has_switch: bool) -> dict:
+    """The "control" of a wallboxes item: the option on, the number present and its range usable; why not; the range; the number's integration; the switch; whether its own minimum is 0."""
+    reason = "option_off" if not option else "entities_missing" if not present else "range_invalid" if rng is None else None
+    return {
+        "enabled": reason is None, "reason": reason, "minA": _amp(rng[0]) if rng else None, "maxA": _amp(rng[1]) if rng else None,
+        "platform": platform if isinstance(platform, str) and _PLATFORM.fullmatch(platform) else None, "switch": has_switch,
+        "zero": bool(rng and rng[2]),  # the number's own minimum is 0: a switch-less STOP may write 0
+    }
+
+
+def generic_report(number: str, switch: str | None, readings: list, control: dict) -> dict:
+    """One item of the /states "wallboxes" list: (key, unit, state, last_reported) readings of power, energy, current (the number's own state) and
+    status (only text of at most 32 allowed characters), bounded as the server does."""
+    items = []
+    for key, unit, state, reported in readings:
+        text = str(state)
+        if key == "status" and not _STATUS.fullmatch(text):
+            continue
+        items.append({"key": key, "unit": unit if isinstance(unit, str) and _utf16(unit) <= MAX_UNIT else "",
+                      "state": text if _utf16(text) <= MAX_STATE else "unknown", "lastReported": _iso(reported)})
+    return {"kind": "ha_generic", "number": number, "switch": switch, "readings": items[:MAX_GENERIC_READINGS], "control": control}
+
+
+class GenericCommand(NamedTuple):
+    id: str
+    mode: str  # stop, fast, eco or green: the rule's mode, audit only
+    amps: float | None  # apply: 0-32 (0: STOP); restore: None
+    duration_s: int | None  # apply: 120-1800
+    renew: bool | None  # apply: extends the live lease (and writes amps when they differ)
+    ttl_ms: int
+
+
+def parse_generic(item: object) -> tuple[str | None, GenericCommand | None]:
+    """Strict check of one claimed set_current command: the apply form has amps, durationS and renew, the restore form amps null and neither
+    of the others (absent or null)."""
+    if not isinstance(item, dict) or not isinstance(cid := item.get("id"), str) or not _UUID.fullmatch(cid):
+        return None, None
+    mode, amps, duration, renew, ttl = (item.get(key) for key in ("mode", "amps", "durationS", "renew", "ttlMs"))
+    valid = (
+        _GENERIC_REQUIRED <= item.keys() <= _GENERIC_COMMAND_KEYS and item["wallbox"] == "set_current" and type(ttl) is int and ttl >= 0
+        and mode in WALLBOX_OPTIONS
+        and (amps is None and duration is None and renew is None
+             or isinstance(amps, (int, float)) and not isinstance(amps, bool) and 0 <= amps <= GENERIC_MAX_A
+             and type(duration) is int and 120 <= duration <= 1800 and type(renew) is bool)
+    )
+    return cid, (GenericCommand(cid, mode, None if amps is None else float(amps), duration, renew, ttl) if valid else None)
+
+
+class GenericLease(NamedTuple):
+    """The restore lease: the apply that armed it, its end (UTC seconds), what it set and what to put back ({"amps", "on"}; a key the lease
+    does not hold is None), and the settle end (a hand change is not looked for before it)."""
+
+    command: str
+    until: float
+    set: dict
+    prev: dict
+    settle: float
+    reason: str | None = None  # option_off: ended early because the option was turned off
+
+
+def _generic_spec(item: object) -> dict | None:
+    """A stored {"amps", "on"} of a lease, sanitised; None when it is not one."""
+    if not isinstance(item, dict) or item.keys() != {"amps", "on"}:
+        return None
+    amps, on = item["amps"], item["on"]
+    if amps is not None and _heat_number(amps) is None or on is not None and type(on) is not bool:
+        return None
+    return {"amps": None if amps is None else float(amps), "on": on}
+
+
+def generic_lease(data: object) -> GenericLease | None:
+    """The stored lease; None when there is none or it is damaged (never guessed)."""
+    try:
+        lease = GenericLease(str(data["command"]), float(data["until"]), _generic_spec(data["set"]), _generic_spec(data["prev"]), float(data["settle"]),
+                             None if data.get("reason") is None else str(data["reason"]))
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+    return lease if lease.set is not None and lease.prev is not None and any(want is not None for want in lease.set.values()) else None
+
+
+def generic_shows(spec: dict, amps: float | None, on: bool | None) -> bool:
+    """Whether the charger shows every value the spec holds (a None key is not held)."""
+    return all((amps is not None and abs(amps - want) < GENERIC_NEAR_A) if key == "amps" else on is want for key, want in spec.items() if want is not None)
+
+
+def generic_verdict(lease: GenericLease, amps: float | None, on: bool | None) -> tuple[str, dict | None]:
+    """The lease end per held key (heat_verdict's rule): at its previous value it is done, at the value the lease set it is put back, at anything
+    else somebody changed it by hand. ("restore", {key: value to write}) | ("ended", None) | ("cancelled", None)."""
+    back = {}
+    for key, want in lease.set.items():
+        if want is None:
+            continue
+        old = lease.prev.get(key)
+        if old is None:  # nothing to put back for this key
+            if not generic_shows({key: want}, amps, on):
+                return "cancelled", None
+        elif generic_shows({key: old}, amps, on):
+            continue
+        elif generic_shows({key: want}, amps, on):
+            back[key] = old
+        else:
+            return "cancelled", None
+    return ("restore", back) if back else ("ended", None)
+
+
+def generic_back_calls(cfg: GenericConfig, back: dict) -> list[tuple[str, str, dict, str, object]]:
+    """The calls that put the values of back (a verdict's) in place: the number first, the switch last. (domain, service, data, key, wanted)."""
+    calls = []
+    if "amps" in back:
+        calls.append(("number", "set_value", {"entity_id": cfg.number, "value": back["amps"]}, "amps", back["amps"]))
+    if "on" in back and cfg.switch:
+        calls.append(("switch", "turn_on" if back["on"] else "turn_off", {"entity_id": cfg.switch}, "on", back["on"]))
+    return calls
+
+
+class GenericWallbox:
+    """WALLBOX-005: another charger's current (a number, with an optional switch) under an HA-enforced restore lease. Pure: Home Assistant is
+    reached through the callbacks, like Wallbox.
+
+    config() gives the resolved entities and range (None: not set up or the number is gone); state(entity_id) gives (state text, last_reported as
+    UTC seconds) or None. "failed" only before the lease is armed (nothing written); once armed every failure is "unknown"; "done" only when a real
+    poll (a written entity's last_reported past the write's own echo) shows every written value. The lease is the only end of a change: the tick
+    puts the previous values back at its end unless it was renewed, and only where the charger still shows what the lease set.
+    """
+
+    def __init__(self, lock: asyncio.Lock, config: Callable[[], GenericConfig | None], enabled: Callable[[], bool],
+                 state: Callable[[str], tuple[str | None, float | None] | None], dispatch: Callable[[str, str, dict], asyncio.Future],
+                 save: Callable[[dict | None], Awaitable], echoes: dict, clock: Callable[[], float] = time.monotonic,
+                 wall: Callable[[], float] = time.time, sleep: Callable[[float], Awaitable] = asyncio.sleep) -> None:
+        self.lock, self.config, self.enabled, self.state, self.dispatch = lock, config, enabled, state, dispatch
+        self._save, self.echoes, self.clock, self.wall, self.sleep = save, echoes, clock, wall, sleep
+        self.lease: GenericLease | None = None
+        self.exit_sent: float | None = None  # monotonic time of the last unconfirmed lease-end write
+        self.ticking = False
+        self.unloaded = False
+
+    def load(self, data: object) -> None:
+        self.lease = generic_lease(data)
+
+    async def save(self) -> None:
+        await self._save(None if self.lease is None else self.lease._asdict())
+
+    async def _drop(self) -> None:
+        self.lease, self.exit_sent = None, None
+        await self.save()
+
+    def _shown(self, entity_id: str) -> tuple[str | None, float | None]:
+        seen = self.state(entity_id)
+        return seen if seen is not None else (None, None)
+
+    def _read(self, cfg: GenericConfig) -> tuple[float | None, bool | None, bool]:
+        """(current in A, switch on, both known): a number that is no number or a switch that is neither on nor off is not known."""
+        try:
+            amps = float(self._shown(cfg.number)[0])
+        except (TypeError, ValueError):
+            amps = None
+        text = self._shown(cfg.switch)[0] if cfg.switch else None
+        on = {"on": True, "off": False}.get(text) if cfg.switch else None
+        return amps, on, amps is not None and math.isfinite(amps) and (not cfg.switch or on is not None)
+
+    def _target(self, amps: float, cfg: GenericConfig) -> dict:
+        """What a command sets: 0 is STOP, the switch off with the number left alone (a switch-less charger gets 0 on its number); else the
+        amps, with the switch on."""
+        if amps == 0:
+            return {"amps": None, "on": False} if cfg.switch else {"amps": 0.0, "on": None}
+        return {"amps": float(amps), "on": True if cfg.switch else None}
+
+    def _allowed(self, amps: float, cfg: GenericConfig) -> bool:
+        if amps == 0:
+            return bool(cfg.switch) or cfg.allows_zero
+        return cfg.min_a is not None and cfg.min_a - 1e-9 <= amps <= cfg.max_a + 1e-9
+
+    def _plan(self, cfg: GenericConfig, spec: dict, amps: float | None, on: bool | None) -> list[tuple[str, str, dict, str, object]]:
+        """The calls that make the charger show spec: the switch on first, the number (not when it shows it already), a switch off."""
+        calls = []
+        if spec["on"] is True and on is False:
+            calls.append(("switch", "turn_on", {"entity_id": cfg.switch}, "on", True))
+        if spec["amps"] is not None and not generic_shows({"amps": spec["amps"]}, amps, on):
+            calls.append(("number", "set_value", {"entity_id": cfg.number, "value": spec["amps"]}, "amps", spec["amps"]))
+        if spec["on"] is False and on is True:
+            calls.append(("switch", "turn_off", {"entity_id": cfg.switch}, "on", False))
+        return calls
+
+    async def execute(self, cmd: GenericCommand, sent: float) -> tuple[str, str | None]:
+        """Run one claimed command; (outcome, reason). The lock is the first await, so commands keep claim order."""
+        until = deadline(sent, cmd.ttl_ms)
+        restore = cmd.amps is None
+        async with self.lock:
+            if restore and self.lease is not None and self.lease.until > self.wall():
+                self.lease = self.lease._replace(until=self.wall())  # a restore ends the lease whatever happens next (before the ttl check)
+                await self.save()
+            if not restore and not self.enabled():
+                return "failed", "wallbox_control_off"
+            if restore and self.lease is None:
+                return "done", None  # nothing SunnyHome set
+            if (cfg := self.config()) is None:
+                return "failed", "entities_missing"
+            amps, on, known = self._read(cfg)
+            if not known:
+                return "failed", "entity_unavailable"
+            if self.clock() >= until:
+                return "failed", "expired_on_arrival"
+            if restore:
+                return await self._restore(cfg, amps, on)
+            if not self._allowed(cmd.amps, cfg):
+                return "failed", "outside_range"
+            spec = self._target(cmd.amps, cfg)
+            if cmd.renew:
+                return await self._renew(cmd, sent, cfg, spec, amps, on)
+            return await self._apply(cmd, sent, cfg, spec, amps, on)
+
+    def _merged(self, spec: dict, lease: GenericLease | None) -> dict:
+        """The lease's set after a change: the new values, and what the old lease held that this one leaves alone (the number under a STOP)."""
+        return {key: want if want is not None else (lease.set[key] if lease else None) for key, want in spec.items()}
+
+    async def _apply(self, cmd: GenericCommand, sent: float, cfg: GenericConfig, spec: dict, amps: float | None, on: bool | None) -> tuple[str, str | None]:
+        elapsed, now, old = self.clock() - sent, self.wall(), self.lease
+        keep = old if old is not None and generic_shows(old.set, amps, on) else None  # still shows what it set: its previous values stay the real ones
+        prev = keep.prev if keep else {"amps": amps, "on": on}
+        self.lease = GenericLease(cmd.id, now - elapsed + cmd.duration_s, self._merged(spec, keep), prev, now + SETTLE_S)
+        self.exit_sent = None
+        await self.save()  # armed before the first write: a crash right after it never leaves a change without its lease
+        return await self._write(cfg, self._plan(cfg, spec, amps, on))
+
+    async def _renew(self, cmd: GenericCommand, sent: float, cfg: GenericConfig, spec: dict, amps: float | None, on: bool | None) -> tuple[str, str | None]:
+        """Only a live lease whose values are still shown is extended; other amps are written under the same lease (its previous values stay)."""
+        lease, now = self.lease, self.wall()
+        if lease is None or lease.until <= now or not generic_shows(lease.set, amps, on):
+            return "failed", "outside_change"
+        until, merged = now - (self.clock() - sent) + cmd.duration_s, self._merged(spec, lease)
+        if merged == lease.set:
+            self.lease = lease._replace(until=until, reason=None)
+            await self.save()
+            return "done", None
+        self.lease = lease._replace(until=until, set=merged, settle=now + SETTLE_S, reason=None)
+        self.exit_sent = None
+        await self.save()
+        return await self._write(cfg, self._plan(cfg, spec, amps, on))
+
+    async def _restore(self, cfg: GenericConfig, amps: float | None, on: bool | None) -> tuple[str, str | None]:
+        verdict, back = generic_verdict(self.lease, amps, on)
+        if verdict == "restore":
+            result = await self._write(cfg, generic_back_calls(cfg, back))
+            if result[0] != "done":
+                return result  # the lease stays (its end is now): the tick puts it back until a real poll shows it
+        await self._drop()  # ended, or changed by hand: nothing written
+        return "done", None
+
+    async def _write(self, cfg: GenericConfig, calls: list) -> tuple[str, str | None]:
+        """The calls in order, then one confirm window: done only after a real poll of every written entity shows its value."""
+        for domain, service, data, _, _ in calls:
+            if not await self._call(domain, service, data):
+                return "unknown", "service_error"
+        if not calls:
+            return "done", None
+        echoes = {data["entity_id"]: self._shown(data["entity_id"])[1] for _, _, data, _, _ in calls}
+        self.echoes.update(echoes)  # the readings are withheld from posts until a real poll
+        end = self.clock() + GENERIC_CONFIRM_S
+        while True:
+            if all(self._polled(entity_id, echo) for entity_id, echo in echoes.items()):
+                amps, on, _ = self._read(cfg)
+                return ("done", None) if all(generic_shows({key: want}, amps, on) for _, _, _, key, want in calls) else ("unknown", "not_applied")
+            if self.clock() >= end:
+                return "unknown", "no_confirmation"
+            await self.sleep(POLL_S)
+
+    def _polled(self, entity_id: str, echo: float | None) -> bool:
+        reported = self._shown(entity_id)[1]
+        return reported is not None and (echo is None or reported > echo)
+
+    async def _call(self, domain: str, service: str, data: dict) -> bool:
+        """One service call, awaited; False when it was refused (also synchronously), failed or ran too long."""
+        try:
+            task = self.dispatch(domain, service, data)
+        except Exception as err:  # noqa: BLE001 - armed: any refusal ends the sequence as unknown
+            _LOGGER.debug("Other wallbox call refused: %s", type(err).__name__)
+            return False
+        if self.lease is not None:
+            self.lease = self.lease._replace(settle=self.wall() + SETTLE_S)
+        end = self.clock() + WALLBOX_CALL_S
+        while not task.done():
+            if self.clock() >= end:
+                return False
+            await self.sleep(POLL_S)
+        return not task.cancelled() and task.exception() is None
+
+    async def tick(self, _now: object = None) -> None:
+        """Every 5 s while a lease is stored: a hand change drops it (no write), its end puts the previous values back until a real poll shows them."""
+        if self.lease is None or self.ticking:
+            return
+        self.ticking = True
+        try:
+            await self._tick()
+        finally:
+            self.ticking = False
+
+    async def _tick(self) -> None:
+        async with self.lock:
+            if self.unloaded:
+                return
+            lease, now = self.lease, self.wall()
+            if lease is None or (cfg := self.config()) is None:
+                return
+            amps, on, known = self._read(cfg)
+            if not known:
+                return  # HA starting (the entities are unknown until their first poll) or gone: neither drop nor write
+            if not self.enabled() and lease.reason != "option_off":
+                lease = self.lease = lease._replace(until=min(lease.until, now), reason="option_off")
+                await self.save()
+            verdict, back = generic_verdict(lease, amps, on)
+            if lease.until > now:
+                if verdict == "cancelled" and now >= lease.settle:
+                    await self._drop()  # someone else changed it: left as it is
+                return
+            held = [cfg.number if key == "amps" else cfg.switch for key, want in lease.set.items() if want is not None]
+            if verdict == "cancelled" or verdict == "ended" and all(self._polled(e, self.echoes.get(e)) for e in held):
+                await self._drop()  # changed by hand, or ended: the previous values, seen by a real poll
+            elif now > lease.until + EXIT_GIVE_UP_S:
+                await self._drop()
+            elif verdict == "restore" and (self.exit_sent is None or self.clock() >= self.exit_sent + EXIT_RETRY_S):
+                self.exit_sent = self.clock()
+                for domain, service, data, _, _ in generic_back_calls(cfg, back):
+                    if not await self._call(domain, service, data):
+                        break
+                    self.echoes[data["entity_id"]] = self._shown(data["entity_id"])[1]

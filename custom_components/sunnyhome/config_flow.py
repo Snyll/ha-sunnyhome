@@ -15,19 +15,32 @@ from homeassistant.core import callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
+    EntitySelector,
+    EntitySelectorConfig,
     SelectOptionDict,
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
 )
 
-from . import payload, sensor_shareable, shareable, solax_charger, solax_remote, unshared_entries
-from .const import CONF_CONTROL, CONF_ENTITIES, CONF_INVERTER, CONF_LINK_ID, CONF_SENSORS, CONF_WALLBOX, DEFAULT_URL, DOMAIN
+from . import binary_shareable, heat_controllable, heat_shareable, payload, person_shareable, sensor_shareable, shareable, solax_charger, solax_remote, unshared_entries
+from .const import (
+    CONF_BINARY, CONF_CONTROL, CONF_ENTITIES, CONF_HEAT, CONF_INVERTER, CONF_LINK_ID, CONF_OTHER_WALLBOX, CONF_OW_CURRENT, CONF_OW_ENERGY, CONF_OW_POWER,
+    CONF_OW_STATUS, CONF_OW_SWITCH, CONF_PEOPLE, CONF_SENSORS, CONF_WALLBOX, DEFAULT_URL, DOMAIN,
+)
 
 _LOGGER = logging.getLogger(__name__)
 _PAIR_ERRORS = {401: "pairing_invalid", 409: "link_limit"}
 USER_SCHEMA = vol.Schema({vol.Required(CONF_URL, default=DEFAULT_URL): str, vol.Required(CONF_CODE): str})
 CODE_SCHEMA = vol.Schema({vol.Required(CONF_CODE): str})
+# WALLBOX-005: the Other wallbox step's fields, with the entity selector that offers each its own kind of entity
+OTHER_WALLBOX_FIELDS = {
+    CONF_OW_POWER: EntitySelectorConfig(domain="sensor", device_class="power"),
+    CONF_OW_CURRENT: EntitySelectorConfig(domain="number"),
+    CONF_OW_SWITCH: EntitySelectorConfig(domain="switch"),
+    CONF_OW_ENERGY: EntitySelectorConfig(domain="sensor", device_class="energy"),
+    CONF_OW_STATUS: EntitySelectorConfig(domain="sensor"),
+}
 
 
 class SunnyHomeConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -98,7 +111,8 @@ class SunnyHomeConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class SunnyHomeOptionsFlow(OptionsFlow):
-    """Choose the switches and lights shared with SunnyHome, the subset it may control and the sensors it may read; none by default."""
+    """Choose the switches and lights shared with SunnyHome, the subset it may control, the sensors it may read and (HA-012) the binary sensors
+    and people it may see and (HA-013) the heat pumps and boilers it may read; none by default."""
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         errors: dict[str, str] = {}
@@ -106,14 +120,17 @@ class SunnyHomeOptionsFlow(OptionsFlow):
             chosen = user_input.get(CONF_ENTITIES, [])
             control = user_input.get(CONF_CONTROL, [])
             sensors = user_input.get(CONF_SENSORS, [])
-            if len(chosen) > payload.MAX_ENTITIES:
-                errors[CONF_ENTITIES] = "too_many"
-            elif not set(control) <= set(chosen):  # also keeps the control list within the 64 cap
+            binary = user_input.get(CONF_BINARY, [])
+            people = user_input.get(CONF_PEOPLE, [])
+            heat = user_input.get(CONF_HEAT, [])
+            if len(chosen) + len(binary) + len(people) + len(heat) > payload.MAX_ENTITIES:  # HA-012, HA-013: one cap of 64 for all four lists
+                errors[CONF_ENTITIES] = errors[CONF_BINARY] = errors[CONF_PEOPLE] = errors[CONF_HEAT] = "too_many"
+            elif not set(control) <= set(chosen) | set(heat):  # also keeps the control list within the 64 cap (HA-014: a heat entity may be ticked too)
                 errors[CONF_CONTROL] = "control_not_shared"
             elif len(sensors) > payload.MAX_SENSORS:
                 errors[CONF_SENSORS] = "too_many_sensors"
             else:
-                self._data = {CONF_ENTITIES: chosen, CONF_CONTROL: control, CONF_SENSORS: sensors}
+                self._data = {CONF_ENTITIES: chosen, CONF_CONTROL: control, CONF_SENSORS: sensors, CONF_BINARY: binary, CONF_PEOPLE: people, CONF_HEAT: heat}
                 if solax_remote(self.hass) is None:  # BAT-008: no single hub with all four entities: the option is off
                     self._data[CONF_INVERTER] = False
                     return await self._wallbox_or_done()
@@ -121,7 +138,13 @@ class SunnyHomeOptionsFlow(OptionsFlow):
         excluded = unshared_entries(self.hass)  # DEYE-003: a Deye entry's entities are never offered
         options = self._options(lambda ent: shareable(ent, excluded))
         sensor_options = self._options(lambda ent: sensor_shareable(ent, excluded))
-        offered = {CONF_ENTITIES: options, CONF_CONTROL: options, CONF_SENSORS: sensor_options}
+        binary_options = self._options(lambda ent: binary_shareable(ent, excluded))
+        people_options = self._options(person_shareable)
+        heat_options = self._options(lambda ent: heat_shareable(ent, excluded))
+        # PLAN-031 integration: a thermostat with a low and a high target only is not offered for control (as the README says)
+        control_options = options + [o for o in heat_options if heat_controllable(self.hass.states.get(o["value"]))]
+        offered = {CONF_ENTITIES: options, CONF_CONTROL: control_options, CONF_SENSORS: sensor_options, CONF_BINARY: binary_options, CONF_PEOPLE: people_options,
+                   CONF_HEAT: heat_options}
         # A ticked device that is gone or no longer shareable would fail the selector's validation.
         current = {
             key: [e for e in (user_input or self.config_entry.options).get(key, []) if e in {o["value"] for o in listed}]
@@ -129,8 +152,14 @@ class SunnyHomeOptionsFlow(OptionsFlow):
         }
         selector = SelectSelector(SelectSelectorConfig(options=options, multiple=True, mode=SelectSelectorMode.LIST))
         sensor_selector = SelectSelector(SelectSelectorConfig(options=sensor_options, multiple=True, mode=SelectSelectorMode.LIST))
+        binary_selector = SelectSelector(SelectSelectorConfig(options=binary_options, multiple=True, mode=SelectSelectorMode.LIST))
+        people_selector = SelectSelector(SelectSelectorConfig(options=people_options, multiple=True, mode=SelectSelectorMode.LIST))
+        control_selector = SelectSelector(SelectSelectorConfig(options=control_options, multiple=True, mode=SelectSelectorMode.LIST))  # HA-014
+        heat_selector = SelectSelector(SelectSelectorConfig(options=heat_options, multiple=True, mode=SelectSelectorMode.LIST))
         schema = vol.Schema({
-            vol.Optional(CONF_ENTITIES): selector, vol.Optional(CONF_CONTROL): selector, vol.Optional(CONF_SENSORS): sensor_selector,
+            vol.Optional(CONF_ENTITIES): selector, vol.Optional(CONF_CONTROL): control_selector, vol.Optional(CONF_SENSORS): sensor_selector,
+            vol.Optional(CONF_BINARY): binary_selector, vol.Optional(CONF_PEOPLE): people_selector,
+            vol.Optional(CONF_HEAT): heat_selector,
         })
         return self.async_show_form(
             step_id="init", data_schema=self.add_suggested_values_to_schema(schema, current), errors=errors
@@ -145,17 +174,43 @@ class SunnyHomeOptionsFlow(OptionsFlow):
         return self.async_show_form(step_id="inverter", data_schema=schema)
 
     async def _wallbox_or_done(self) -> ConfigFlowResult:
-        """EV-004: the Wallbox control step only with one EV-charger hub that has its three selects; else the option is off."""
+        """EV-004: the Wallbox control step only with one EV-charger hub that has its three selects; else the option is off.
+        WALLBOX-005: the Other wallbox step follows either way."""
         if solax_charger(self.hass) is None:
-            return self.async_create_entry(data={**self._data, CONF_WALLBOX: False})
+            self._data[CONF_WALLBOX] = False
+            return await self.async_step_other_wallbox()
         return await self.async_step_wallbox()
 
     async def async_step_wallbox(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """EV-004: the separate wallbox-control opt-in, off by default, with its own warning."""
         if user_input is not None:
-            return self.async_create_entry(data={**self._data, CONF_WALLBOX: bool(user_input.get(CONF_WALLBOX))})
+            self._data[CONF_WALLBOX] = bool(user_input.get(CONF_WALLBOX))
+            return await self.async_step_other_wallbox()
         schema = vol.Schema({vol.Required(CONF_WALLBOX, default=bool(self.config_entry.options.get(CONF_WALLBOX))): bool})
         return self.async_show_form(step_id="wallbox", data_schema=schema)
+
+    async def async_step_other_wallbox(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """WALLBOX-005: another charger: its power sensor and current number (A) are required together (both empty: none), a switch, a session
+        energy sensor and a status sensor are optional, and the control opt-in is off by default with its own warning."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            values = {key: user_input.get(key) or None for key in OTHER_WALLBOX_FIELDS}
+            number = self.hass.states.get(values[CONF_OW_CURRENT]) if values[CONF_OW_CURRENT] else None
+            bad = payload.other_wallbox_error(values[CONF_OW_POWER], values[CONF_OW_CURRENT], number.attributes if number else None)
+            if bad:
+                errors[CONF_OW_POWER if bad[0] == "power" else CONF_OW_CURRENT] = bad[1]
+            else:
+                chosen = {key: value for key, value in values.items() if value and values[CONF_OW_POWER]}  # none without a wallbox
+                return self.async_create_entry(data={**self._data, **chosen, CONF_OTHER_WALLBOX: bool(chosen and user_input.get(CONF_OTHER_WALLBOX))})
+        schema = vol.Schema({
+            **{vol.Optional(key): EntitySelector(config) for key, config in OTHER_WALLBOX_FIELDS.items()},
+            vol.Required(CONF_OTHER_WALLBOX, default=bool(self.config_entry.options.get(CONF_OTHER_WALLBOX))): bool,
+        })
+        current = user_input or self.config_entry.options
+        return self.async_show_form(
+            step_id="other_wallbox", data_schema=self.add_suggested_values_to_schema(schema, {key: current[key] for key in OTHER_WALLBOX_FIELDS if current.get(key)}),
+            errors=errors,
+        )
 
     def _options(self, rule) -> list[SelectOptionDict]:
         """The registry entities the rule allows, labelled "name (entity id)" and sorted by label."""

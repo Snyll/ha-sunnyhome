@@ -9,6 +9,10 @@ service for solar homes.
   [Solarman](https://github.com/davidrapan/ha-solarman).
 - **Your devices on the SunnyHome dashboard**, and sensors for automation rules: only the switches,
   lights and sensors you tick.
+- **Binary sensors and people** (door, window, motion and similar sensors, and whether a person is
+  home or away) that you tick, read only.
+- **Heat pumps and boilers** (thermostats and water heaters): their temperature and mode are read;
+  the target temperature and mode can be set for the ones you tick for control.
 - **Control only if you allow it**, with a safety stop: a device SunnyHome switched on is switched
   off again by Home Assistant if SunnyHome stops renewing it for 15 minutes.
 - **Outbound only.** Home Assistant connects out to SunnyHome over HTTPS; nothing is opened to the
