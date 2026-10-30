@@ -1,6 +1,7 @@
 {
   "domain": "sunnyhome",
   "name": "SunnyHome",
+  "after_dependencies": ["energy"],
   "codeowners": ["@Snyll"],
   "config_flow": true,
   "dependencies": [],
@@ -9,5 +10,5 @@
   "iot_class": "cloud_push",
   "issue_tracker": "https://github.com/Snyll/ha-sunnyhome/issues",
   "requirements": [],
-  "version": "0.20.0"
+  "version": "0.20.1"
 }
