@@ -1038,7 +1038,7 @@ async def _lease_command(cmd: Command, until: float, env: Env) -> tuple[str, str
             if outcome[0] == "done" or outcome[1] in ("outside_change", "not_controllable", "restore_invalid"):
                 env.leases.cancel(cmd.entity_id)
                 await env.save()
-            if outcome[1] in ("outside_change", "restore_invalid"):  # HA-021 (§2g): done, but nothing was put back, and why
+            if outcome[1] in ("outside_change", "not_controllable", "restore_invalid"):  # HA-021 (§2g): done, but nothing was put back, and why (AUTO-028 post review: not_controllable too)
                 return "done", outcome[1], False
         elif env.leases is not None and env.leases.cancel(cmd.entity_id) is not None:
             await env.save()
