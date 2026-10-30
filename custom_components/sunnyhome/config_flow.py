@@ -23,9 +23,12 @@ from homeassistant.helpers.selector import (
     SelectSelectorMode,
 )
 
-from . import binary_shareable, heat_controllable, heat_shareable, payload, person_shareable, sensor_shareable, shareable, solax_charger, solax_remote, unshared_entries
+from . import (
+    binary_shareable, device_choices, heat_controllable, heat_shareable, other_wallbox_ids, payload, person_shareable, sensor_shareable, shareable, solax_charger,
+    solax_remote, unshared_entries,
+)
 from .const import (
-    CONF_BINARY, CONF_CONTROL, CONF_ENTITIES, CONF_HEAT, CONF_INVERTER, CONF_LINK_ID, CONF_OTHER_WALLBOX, CONF_OW_CURRENT, CONF_OW_ENERGY, CONF_OW_POWER,
+    CONF_BINARY, CONF_CONTROL, CONF_DEVICES, CONF_ENTITIES, CONF_HEAT, CONF_INVERTER, CONF_LINK_ID, CONF_OTHER_WALLBOX, CONF_OW_CURRENT, CONF_OW_ENERGY, CONF_OW_POWER,
     CONF_OW_STATUS, CONF_OW_SWITCH, CONF_PEOPLE, CONF_SENSORS, CONF_WALLBOX, DEFAULT_URL, DOMAIN,
 )
 
@@ -112,7 +115,7 @@ class SunnyHomeConfigFlow(ConfigFlow, domain=DOMAIN):
 
 class SunnyHomeOptionsFlow(OptionsFlow):
     """Choose the switches and lights shared with SunnyHome, the subset it may control, the sensors it may read and (HA-012) the binary sensors
-    and people it may see and (HA-013) the heat pumps and boilers it may read; none by default."""
+    and people it may see and (HA-013) the heat pumps and boilers it may read; none by default. HA-021: whole devices, shared with their control (D2)."""
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         errors: dict[str, str] = {}
@@ -123,14 +126,24 @@ class SunnyHomeOptionsFlow(OptionsFlow):
             binary = user_input.get(CONF_BINARY, [])
             people = user_input.get(CONF_PEOPLE, [])
             heat = user_input.get(CONF_HEAT, [])
+            devices = user_input.get(CONF_DEVICES, [])
+            choices = {device_id: ents for device_id, _, ents in device_choices(self.hass, other_wallbox_ids(self.config_entry.options))}
+            expanded = {ent.entity_id for device_id in devices for ent in choices.get(device_id, ())}
+            device_sensors = {entity_id for entity_id in expanded if entity_id.startswith("sensor.")}
             if len(chosen) + len(binary) + len(people) + len(heat) > payload.MAX_ENTITIES:  # HA-012, HA-013: one cap of 64 for all four lists
                 errors[CONF_ENTITIES] = errors[CONF_BINARY] = errors[CONF_PEOPLE] = errors[CONF_HEAT] = "too_many"
             elif not set(control) <= set(chosen) | set(heat):  # also keeps the control list within the 64 cap (HA-014: a heat entity may be ticked too)
                 errors[CONF_CONTROL] = "control_not_shared"
             elif len(sensors) > payload.MAX_SENSORS:
                 errors[CONF_SENSORS] = "too_many_sensors"
+            elif not set(devices) <= choices.keys():  # HA-021: a device of an energy integration or the Energy dashboard, or one that is gone
+                errors[CONF_DEVICES] = "device_not_shareable"
+            elif (len(set(chosen + binary + people + heat) | (expanded - device_sensors)) > payload.MAX_DEVICE_ENTITIES
+                  or len(set(sensors) | device_sensors) > payload.MAX_DEVICE_SENSORS):  # HA-021: what the devices expand to, against the raised caps
+                errors[CONF_DEVICES] = "too_many_device_entities"
             else:
-                self._data = {CONF_ENTITIES: chosen, CONF_CONTROL: control, CONF_SENSORS: sensors, CONF_BINARY: binary, CONF_PEOPLE: people, CONF_HEAT: heat}
+                self._data = {CONF_ENTITIES: chosen, CONF_CONTROL: control, CONF_SENSORS: sensors, CONF_BINARY: binary, CONF_PEOPLE: people, CONF_HEAT: heat,
+                              CONF_DEVICES: devices}
                 if solax_remote(self.hass) is None:  # BAT-008: no single hub with all four entities: the option is off
                     self._data[CONF_INVERTER] = False
                     return await self._wallbox_or_done()
@@ -141,10 +154,11 @@ class SunnyHomeOptionsFlow(OptionsFlow):
         binary_options = self._options(lambda ent: binary_shareable(ent, excluded))
         people_options = self._options(person_shareable)
         heat_options = self._options(lambda ent: heat_shareable(ent, excluded))
-        # PLAN-031 integration: a thermostat with a low and a high target only is not offered for control (as the README says)
+        # PLAN-031 integration: a heat entity without a target is not offered for control (HA-021, D7: one with a low and a high target is)
         control_options = options + [o for o in heat_options if heat_controllable(self.hass.states.get(o["value"]))]
+        device_options = [SelectOptionDict(value=device_id, label=label) for device_id, label, _ in device_choices(self.hass, other_wallbox_ids(self.config_entry.options))]
         offered = {CONF_ENTITIES: options, CONF_CONTROL: control_options, CONF_SENSORS: sensor_options, CONF_BINARY: binary_options, CONF_PEOPLE: people_options,
-                   CONF_HEAT: heat_options}
+                   CONF_HEAT: heat_options, CONF_DEVICES: device_options}
         # A ticked device that is gone or no longer shareable would fail the selector's validation.
         current = {
             key: [e for e in (user_input or self.config_entry.options).get(key, []) if e in {o["value"] for o in listed}]
@@ -156,7 +170,10 @@ class SunnyHomeOptionsFlow(OptionsFlow):
         people_selector = SelectSelector(SelectSelectorConfig(options=people_options, multiple=True, mode=SelectSelectorMode.LIST))
         control_selector = SelectSelector(SelectSelectorConfig(options=control_options, multiple=True, mode=SelectSelectorMode.LIST))  # HA-014
         heat_selector = SelectSelector(SelectSelectorConfig(options=heat_options, multiple=True, mode=SelectSelectorMode.LIST))
+        # HA-021: whole devices first; a list of the devices that may be shared (an excluded one is never offered), as the entity lists are
+        device_selector = SelectSelector(SelectSelectorConfig(options=device_options, multiple=True, mode=SelectSelectorMode.LIST))
         schema = vol.Schema({
+            vol.Optional(CONF_DEVICES): device_selector,
             vol.Optional(CONF_ENTITIES): selector, vol.Optional(CONF_CONTROL): control_selector, vol.Optional(CONF_SENSORS): sensor_selector,
             vol.Optional(CONF_BINARY): binary_selector, vol.Optional(CONF_PEOPLE): people_selector,
             vol.Optional(CONF_HEAT): heat_selector,

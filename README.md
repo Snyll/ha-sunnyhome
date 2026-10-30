@@ -13,8 +13,16 @@ service for solar homes.
   home or away) that you tick, read only.
 - **Heat pumps and boilers** (thermostats and water heaters): their temperature and mode are read;
   the target temperature and mode can be set for the ones you tick for control.
+- **Whole devices**: tick a Home Assistant device to share everything allowed of it at once, also the
+  entities it gets later: switches, lights, binary sensors, heating and air conditioning (with
+  humidity, presets and low and high targets), selects, numbers and numeric sensors. Disabled, hidden
+  and diagnostic entities (except sensors) stay out. A whole device shares its control too: once you
+  allow control in SunnyHome, it may switch, set and choose the device's controllable entities, only
+  within the options and ranges the device reports. Devices of inverter, battery and energy
+  integrations and devices the Energy dashboard uses are never offered.
 - **Control only if you allow it**, with a safety stop: a device SunnyHome switched on is switched
-  off again by Home Assistant if SunnyHome stops renewing it for 15 minutes.
+  off again by Home Assistant if SunnyHome stops renewing it for 15 minutes, and a temperature,
+  preset, option or number a SunnyHome rule changed is put back, unless you changed it by hand.
 - **Outbound only.** Home Assistant connects out to SunnyHome over HTTPS; nothing is opened to the
   internet and no Home Assistant credentials are shared. Inverter settings are read, never changed.
 
@@ -44,7 +52,8 @@ Home Assistant.
 1. In SunnyHome choose **Connect Home Assistant** and note the code (`XXXX-XXXX`, valid 10 minutes).
 2. In Home Assistant open **Settings → Devices & services → Add integration → SunnyHome** and enter
    the code.
-3. Under **Configure** tick the devices and sensors to share, and the ones SunnyHome may switch.
+3. Under **Configure** tick whole devices, or the devices and sensors one by one and the ones
+   SunnyHome may switch.
 
 ## Support
 

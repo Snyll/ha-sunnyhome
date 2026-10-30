@@ -37,8 +37,9 @@
     "step": {
       "init": {
         "title": "Devices shared with SunnyHome",
-        "description": "Only the ticked switches and lights are shared with SunnyHome: their name, state and brightness. SolaX Modbus entities are never offered.\n\n**Control:** SunnyHome can switch on and off, and dim, the devices ticked under \"Devices SunnyHome may control\" once control is also allowed for this connection in SunnyHome. Heating and hot water entities ticked above can be ticked here too. Never tick a switch of an inverter, battery or EV charger there.\n\n**Sensors:** SunnyHome receives the value, unit and time of the temperature, power, energy, battery, voltage, current, humidity, gas and water sensors ticked under \"Sensors SunnyHome may read\", for its automation rules and the Device widget.\n\n**Binary sensors and people:** SunnyHome receives only the on or off state of the door, window, garage door, opening, motion and occupancy sensors ticked under \"Binary sensors SunnyHome may see\", and only home or away for the people ticked under \"People SunnyHome may see\". It never receives a person's zone, place name, coordinates or device trackers. They are read only and shown on the Device widget; SunnyHome never controls them.\n\n**Heating and hot water:** SunnyHome receives only the mode, current and target temperature, allowed temperature range and available modes of the heat pumps, thermostats and water heaters ticked under \"Heating and hot water SunnyHome may read\", and whether a thermostat is heating or cooling. Nothing else of them is sent. They are shown on the Device widget. SunnyHome sets a target temperature or mode only for the ones also ticked under \"Devices SunnyHome may control\", and only once control is allowed for this connection in SunnyHome. For a change made by an automation rule, Home Assistant puts the previous target and mode back when the rule stops renewing it, but only if nobody changed them by hand meanwhile. A thermostat with a low and a high target only is never controlled.",
+        "description": "**Whole devices:** tick a Home Assistant device under \"Whole devices\" to share all of it at once, including entities it gets later: its switches and lights, door, window and motion sensors, heating and air conditioning, selects and numbers (for example an air conditioner's fan mode or a display brightness) and its numeric sensors (any kind, for example power, energy, humidity or signal). Disabled and hidden entities are never sent, nor diagnostic ones other than sensors. **A whole device also shares its control:** once control is allowed for this connection in SunnyHome, SunnyHome can switch its switches and lights, set its heating and air conditioning (target, low and high target, mode, preset), choose a select's option and set a number, always within what the device itself allows. Devices of inverter, battery and energy integrations, devices the Energy dashboard uses and the entities chosen for the Other wallbox are never shared this way and are not offered.\n\nOnly the ticked switches and lights are shared with SunnyHome: their name, state and brightness. SolaX Modbus entities are never offered.\n\n**Control:** SunnyHome can switch on and off, and dim, the devices ticked under \"Devices SunnyHome may control\" once control is also allowed for this connection in SunnyHome. Heating and hot water entities ticked above can be ticked here too. Never tick a switch of an inverter, battery or EV charger there.\n\n**Sensors:** SunnyHome receives the value, unit and time of the temperature, power, energy, battery, voltage, current, humidity, gas and water sensors ticked under \"Sensors SunnyHome may read\", for its automation rules and the Device widget.\n\n**Binary sensors and people:** SunnyHome receives only the on or off state of the door, window, garage door, opening, motion and occupancy sensors ticked under \"Binary sensors SunnyHome may see\", and only home or away for the people ticked under \"People SunnyHome may see\". It never receives a person's zone, place name, coordinates or device trackers. They are read only and shown on the Device widget; SunnyHome never controls them.\n\n**Heating and hot water:** SunnyHome receives only the mode, current and target temperature, allowed temperature range and available modes of the heat pumps, thermostats and water heaters ticked under \"Heating and hot water SunnyHome may read\", and whether a thermostat is heating or cooling. Nothing else of them is sent. They are shown on the Device widget. SunnyHome sets a target temperature or mode only for the ones also ticked under \"Devices SunnyHome may control\", and only once control is allowed for this connection in SunnyHome. For a change made by an automation rule (a target, a low and high target, a mode, a preset, a select's option or a number), Home Assistant puts the previous value back when the rule stops renewing it, but only if nobody changed it by hand meanwhile.",
         "data": {
+          "devices": "Whole devices",
           "entities": "Shared devices",
           "control": "Devices SunnyHome may control",
           "sensors": "Sensors SunnyHome may read",
@@ -47,6 +48,7 @@
           "heat": "Heating and hot water SunnyHome may read"
         },
         "data_description": {
+          "devices": "Everything allowed of each device is shared and may be controlled, also entities added later. At most 512 entities and 512 sensors together with the lists below. Leave empty and no whole device is shared.",
           "control": "Each must also be ticked under Shared devices or Heating and hot water. Leave empty and SunnyHome controls nothing.",
           "sensors": "At most 32. Leave empty and SunnyHome reads no sensors.",
           "binary_sensors": "Door, window, garage door, opening, motion and occupancy sensors: on or off only. Together with the shared devices, people and heating at most 64. Leave empty and SunnyHome sees none.",
@@ -95,13 +97,23 @@
       "too_many_sensors": "Choose at most 32 sensors.",
       "needs_both": "Choose both the power sensor and the charging current number, or leave both empty.",
       "number_unit": "The charging current number must be in amperes (A).",
-      "number_range": "The charging current number needs a minimum and a maximum that allow some current between 6 A and 32 A."
+      "number_range": "The charging current number needs a minimum and a maximum that allow some current between 6 A and 32 A.",
+      "device_not_shareable": "This device cannot be shared as a whole: it belongs to an inverter, battery or energy integration, the Energy dashboard uses it, or it is gone.",
+      "too_many_device_entities": "The whole devices and the lists below have more than 512 entities or 512 sensors together."
     }
   },
   "issues": {
     "multiple_hubs": {
       "title": "Several inverter integrations are not supported yet",
       "description": "SunnyHome found more than one inverter integration entry (SolaX Modbus, GoodWe or Deye), so it sends no inverter data. Keep a single one to resume sending."
+    },
+    "server_older": {
+      "title": "SunnyHome does not take whole devices yet",
+      "description": "This SunnyHome server is older than this integration, so the whole devices ticked in the options are not sent; the entities ticked one by one still are. Nothing needs to be done: they are sent as soon as SunnyHome is updated."
+    },
+    "devices_trimmed": {
+      "title": "Some entities of whole devices are not sent",
+      "description": "The whole devices ticked in the options have more entities than SunnyHome takes (512 entities and 512 sensors, or the size of one report), so only the first ones by entity id are sent. Untick a device or share its entities one by one."
     }
   }
 }

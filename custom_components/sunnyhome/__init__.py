@@ -41,6 +41,13 @@ and the switch's previous values back at its end, only where they still show wha
 itself is down, the charger keeps its setting.
 HA-016 (0.18.0): each shared entity except a person carries its Home Assistant device's name and manufacturer, so SunnyHome's
 picker groups one device's entities together.
+HA-021 (0.20.0): whole devices ticked in the options send every allowed entity of the device (switches, lights, binary sensors, heat
+entities, selects, numbers and numeric sensors; no disabled, hidden or non-sensor diagnostic entity), new ones included, and every
+controllable one of them is controllable (no separate control list) and watched for leases. Devices of energy integrations, devices the
+Energy dashboard uses and the Other wallbox entities are never expanded. The component posts the 0.19.0 shape until SunnyHome's answer
+carries "contract":2, then the 0.20.0 shape: gzip, the HA device id and model, config categories, state classes, Energy dashboard roles,
+climate humidity, presets and range targets, and up to 512 entities and 512 sensors. Rule leases also hold a select's option, a number's
+value, a climate's preset and range targets, and put them back at the lease end where nobody changed them by hand.
 """
 
 from __future__ import annotations
@@ -50,6 +57,7 @@ import logging
 import time
 import uuid
 from datetime import datetime, timedelta
+from functools import partial
 
 import aiohttp
 import voluptuous as vol
@@ -58,19 +66,19 @@ from homeassistant import loader
 from homeassistant.components.light import brightness_supported
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_TOKEN, CONF_URL
-from homeassistant.core import Context, HomeAssistant, callback
+from homeassistant.core import Context, CoreState, HomeAssistant, callback
 from homeassistant.exceptions import ServiceNotFound
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers import storage
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.event import async_track_state_change_event, async_track_time_interval
+from homeassistant.helpers.event import async_call_later, async_track_state_change_event, async_track_time_interval
 from homeassistant.util import dt as dt_util
 
 from . import payload
 from .const import (
-    CONF_BINARY, CONF_CONTROL, CONF_ENTITIES, CONF_HEAT, CONF_INVERTER, CONF_OTHER_WALLBOX, CONF_OW_CURRENT, CONF_OW_ENERGY, CONF_OW_POWER,
+    CONF_BINARY, CONF_CONTROL, CONF_DEVICES, CONF_ENTITIES, CONF_HEAT, CONF_INVERTER, CONF_OTHER_WALLBOX, CONF_OW_CURRENT, CONF_OW_ENERGY, CONF_OW_POWER,
     CONF_OW_STATUS, CONF_OW_SWITCH, CONF_PEOPLE, CONF_SENSORS, CONF_WALLBOX, DOMAIN, VERSION,
 )
 
@@ -82,6 +90,18 @@ SOLARMAN = "solarman"  # DEYE-003: ha-solarman (Deye) and HA core's Solarman plu
 ISSUE = "multiple_hubs"  # GW-002: several inverter integration entries (of one kind or mixed)
 SERIAL_KEYS = ("measured_power", "inverter_power")
 SHARED_DOMAINS = ("switch", "light")
+# HA-021: a whole device of one of these integrations is never expanded (an inverter's work mode or export limit, a battery's reserve must never
+# become controllable); extended as users report. INVERTERS and the Deye entries (unshared_entries) count too.
+ENERGY_PLATFORMS = frozenset({*INVERTERS, "huawei_solar", "sungrow", "victron", "victron_ble", "fronius", "solax", "solis", "growatt_server", "sunsynk",
+                              "solaredge", "sma", "enphase_envoy", "powerwall", "tesla_fleet", "teslemetry",
+                              # EV chargers: their current and mode are SunnyHome's wallbox control, never a whole device's
+                              "easee", "wallbox", "ocpp", "zaptec", "goecharger", "go_echarger", "go_e", "tesla_wall_connector", "openevse", "keba",
+                              "ohme", "myenergi", "peblar", "alfen_wallbox", "v2c", "nrgkick", "evcc_intg"})
+CONTROL_DOMAINS = frozenset({*SHARED_DOMAINS, *payload.HEAT_DOMAINS, *payload.SETTING_DOMAINS})  # HA-021: what a whole device shares control of (D2)
+NOT_NUMERIC = frozenset({"enum", "timestamp", "date"})  # HA-021: sensor classes that are never a reading
+ISSUE_OLD = "server_older"  # HA-021: devices are ticked but SunnyHome does not take the 0.20.0 shape yet
+ISSUE_TRIM = "devices_trimmed"  # HA-021: whole devices pass the caps or the byte budget
+RELOAD_S = 30  # HA-021: an entity registry change of a shared device reloads the entry after this quiet time
 BACKOFF_MIN, BACKOFF_MAX = 10, 300
 LEASE_TICK_S = 5  # how often due leases are checked
 REPORT_WINDOW_S = 900  # a lease report is retried this long, then dropped (SunnyHome reconciles it by time)
@@ -226,16 +246,129 @@ def heat_shareable(ent: er.RegistryEntry, excluded: frozenset[str] = frozenset()
 
 def heat_controllable(state) -> bool:
     """HA-014: a heat entity supports a target temperature (feature bit 1 of climate and of water_heater); one that is not in the state machine
-    or unavailable keeps its last decision (true), so a lease end is never skipped just because the device blinked. A dual setpoint only
-    (feature bit 2) stays read only."""
+    or unavailable keeps its last decision (true), so a lease end is never skipped just because the device blinked. HA-021 (D7): a climate with a
+    low and a high target (feature bit 2; a water heater's bit 2 is its operation mode) is controllable too."""
     if state is None or state.state in ("unavailable", "unknown"):
         return True
     features = state.attributes.get("supported_features")
-    return isinstance(features, int) and features & 1 == 1
+    return isinstance(features, int) and (features & 1 == 1 or features & 2 == 2 and getattr(state, "domain", None) != "water_heater")
+
+
+def setting_shareable(ent: er.RegistryEntry, excluded: frozenset[str] = frozenset()) -> bool:
+    """HA-021: an enabled select or number of a whole device, not of an energy integration, within the server's id rule."""
+    return (ent.domain in payload.SETTING_DOMAINS and ent.platform not in ENERGY_PLATFORMS and not ent.disabled
+            and not (excluded and ent.config_entry_id in excluded) and payload._STATE_ID.fullmatch(ent.entity_id) is not None)
+
+
+def device_sensor_shareable(ent: er.RegistryEntry, excluded: frozenset[str] = frozenset()) -> bool:
+    """HA-021 (D3): a numeric sensor of a whole device, of any class within the server's rule or none: one of SENSOR_CLASSES, or one with a state
+    class or a unit (never an enum, timestamp or date)."""
+    kind = ent.device_class or ent.original_device_class
+    return (
+        ent.domain == "sensor" and ent.platform not in ENERGY_PLATFORMS and not ent.disabled and not (excluded and ent.config_entry_id in excluded)
+        and payload.SENSOR_ID.fullmatch(ent.entity_id) is not None and (kind is None or payload.ANY_CLASS.fullmatch(kind) is not None)
+        and kind not in NOT_NUMERIC and (kind in payload.SENSOR_CLASSES or bool((ent.capabilities or {}).get("state_class")) or bool(ent.unit_of_measurement))
+    )
+
+
+def _expands(ent: er.RegistryEntry, excluded: frozenset[str]) -> bool:
+    """HA-021: the existing *_shareable rules plus the select, number and device sensor rules (a person has no device)."""
+    return (shareable(ent, excluded) or binary_shareable(ent, excluded) or heat_shareable(ent, excluded) or setting_shareable(ent, excluded)
+            or device_sensor_shareable(ent, excluded))
+
+
+def whole_device(registry: er.EntityRegistry, device_id: str, excluded: frozenset[str], roles: dict, ow: frozenset[str]) -> list[er.RegistryEntry] | None:
+    """HA-021: the entities a whole-device share sends, by entity id; None for a device that is never expanded: one with an entity of an energy
+    integration (ENERGY_PLATFORMS, a Deye entry) or one the Energy dashboard uses (D6). Disabled, hidden and diagnostic entities (sensors excepted, D3)
+    and the Other wallbox entities are left out."""
+    ents = er.async_entries_for_device(registry, device_id, include_disabled_entities=True)
+    if not ents or any(ent.platform in ENERGY_PLATFORMS or (excluded and ent.config_entry_id in excluded) or ent.entity_id in roles for ent in ents):
+        return None
+    return sorted((ent for ent in ents if ent.entity_id not in ow and not ent.disabled and ent.hidden_by is None
+                   and (ent.entity_category != "diagnostic" or ent.domain == "sensor") and _expands(ent, excluded)), key=lambda ent: ent.entity_id)
+
+
+def energy_roles(hass: HomeAssistant) -> dict[str, str]:
+    """HA-021 (D6): {entity id: grid | solar | battery} of the Energy dashboard, as last read by watch_energy (empty until then or on failure)."""
+    return hass.data.get(DOMAIN, {}).get("energy_roles", {})
+
+
+async def watch_energy(hass: HomeAssistant) -> None:
+    """HA-021 (D6): reads the Energy dashboard's sources once per Home Assistant run and again on every change (an internal HA API, so guarded:
+    on any failure there are no roles, and SunnyHome's name fallback applies). Never in collect(): the manager is async."""
+    shared = hass.data.setdefault(DOMAIN, {})
+    if "energy_roles" in shared:
+        return
+    shared["energy_roles"] = {}
+    try:
+        from homeassistant.components.energy import data as energy_data  # noqa: PLC0415 - internal, imported only here
+
+        manager = await energy_data.async_get_manager(hass)
+
+        async def update() -> None:
+            shared["energy_roles"] = payload.energy_roles(manager.data)
+        await update()
+        manager.async_listen_updates(update)
+    except Exception as err:  # noqa: BLE001 - an internal API: anything may change
+        _LOGGER.debug("Energy dashboard not read: %s", type(err).__name__)
+
+
+def other_wallbox_ids(options) -> frozenset[str]:
+    """HA-021: the Other wallbox entities (WALLBOX-005), never part of a whole-device share."""
+    return frozenset(options.get(key) for key in (CONF_OW_POWER, CONF_OW_CURRENT, CONF_OW_SWITCH, CONF_OW_ENERGY, CONF_OW_STATUS) if options.get(key))
+
+
+def device_entities(hass: HomeAssistant, entry: ConfigEntry) -> list[er.RegistryEntry]:
+    """HA-021: the entities of the ticked whole devices, once each, by entity id (no cap: the pusher caps what it sends)."""
+    devices = entry.options.get(CONF_DEVICES) or []
+    if not devices:
+        return []
+    registry, excluded, roles, ow = er.async_get(hass), unshared_entries(hass), energy_roles(hass), other_wallbox_ids(entry.options)
+    found = {}
+    for device_id in devices:
+        for ent in whole_device(registry, device_id, excluded, roles, ow) or ():
+            found.setdefault(ent.entity_id, ent)
+    return [found[key] for key in sorted(found)]
+
+
+def main_device(hass: HomeAssistant, device_id: str | None):
+    """The device registry entry of a device id; for a child device (HA 2026.10) its parent, where the manufacturer, model, serial number and
+    firmware live (reading them on a child is deprecated, removed in 2027.9). Plain async_get(id): its keywords do not exist in HA 2025.1."""
+    devices = dr.async_get(hass)
+    device = devices.async_get(device_id) if device_id else None
+    parent = getattr(device, "parent_device_id", None)  # only a child device has it
+    return devices.async_get(parent) if isinstance(parent, str) else device
+
+
+def all_devices(hass: HomeAssistant) -> list:
+    """Every device registry entry: HA 2026.10's devices view yields the entries when iterated (using it as a mapping, .values() included, is
+    deprecated and stops working in 2027.9); an older HA's dict (2025.1) yields the ids, which async_get resolves."""
+    devices = dr.async_get(hass)
+    return [devices.async_get(item) if isinstance(item, str) else item for item in devices.devices]
+
+
+def device_choices(hass: HomeAssistant, ow: frozenset[str]) -> list[tuple[str, str, list[er.RegistryEntry]]]:
+    """HA-021: (device id, label, entities) of every device a whole-device share may take, by label; an excluded device is never offered."""
+    registry, excluded, roles = er.async_get(hass), unshared_entries(hass), energy_roles(hass)
+    found = []
+    for device in all_devices(hass):
+        if device is None:
+            continue
+        if ents := whole_device(registry, device.id, excluded, roles, ow):
+            name = device.name_by_user or device.name or device.id
+            maker = " ".join(text for text in (device.manufacturer, device.model) if text)
+            found.append((device.id, f"{name} ({maker})" if maker else name, ents))
+    return sorted(found, key=lambda choice: choice[1].casefold())
+
+
+def device_control(hass: HomeAssistant, entry: ConfigEntry) -> set[str]:
+    """HA-021 (D2): the controllable kinds of the whole devices (switch, light, heat, select, number), whatever their state: the lease watcher's part."""
+    return {ent.entity_id for ent in device_entities(hass, entry) if ent.domain in CONTROL_DOMAINS}
 
 
 def controllable(hass: HomeAssistant, entry: ConfigEntry) -> set[str]:
-    """The control list as enforced: ticked for control, still shared and still shareable. HA-014: a ticked heat entity that supports a target."""
+    """The control list as enforced: ticked for control, still shared and still shareable. HA-014: a ticked heat entity that supports a target.
+    HA-021 (D2): every controllable entity of a whole device too, without a control list."""
     registry = er.async_get(hass)
     shared = entry.options.get(CONF_ENTITIES, [])[: payload.MAX_ENTITIES]
     heat = entry.options.get(CONF_HEAT, [])[: payload.MAX_ENTITIES]
@@ -244,7 +377,13 @@ def controllable(hass: HomeAssistant, entry: ConfigEntry) -> set[str]:
         e for e in entry.options.get(CONF_CONTROL, [])
         if (e in shared and (ent := registry.async_get(e)) is not None and shareable(ent, excluded))
         or (e in heat and (ent := registry.async_get(e)) is not None and heat_shareable(ent, excluded) and heat_controllable(hass.states.get(e)))
-    }
+    } | {e for e in device_control(hass, entry) if e.split(".", 1)[0] not in payload.HEAT_DOMAINS or heat_controllable(hass.states.get(e))}
+
+
+def watched(hass: HomeAssistant, entry: ConfigEntry) -> list[str]:
+    """The entities the lease watcher follows: the ticked control list (PLAN-031 integration: not the filtered one, so a heat entity that blinked is
+    still watched) and HA-021 the controllable entities of the whole devices."""
+    return sorted(set(entry.options.get(CONF_CONTROL, [])[: payload.MAX_ENTITIES]) | device_control(hass, entry))
 
 
 def hub_plugin(hub: ConfigEntry) -> str | None:
@@ -278,18 +417,42 @@ def solax_remote(hass: HomeAssistant) -> payload.Remote | None:
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    await watch_energy(hass)  # HA-021 (D6): before the first push, never in collect()
     pusher = Pusher(hass, entry)
+    await pusher.load()  # HA-021: the stored contract, so a restart posts the 0.20.0 shape at once
     entry.async_on_unload(async_track_time_interval(hass, pusher.tick, timedelta(seconds=10), name="SunnyHome push"))
     entry.async_on_unload(entry.add_update_listener(_reload))
     runner = CommandRunner(hass, entry)
     # AUTO-004: the leases are kept with or without a control list (an empty list drops them) and whatever the token's state,
     # so a lease still ends its device after an unlink.
     await runner.start_leases()
-    # BAT-008: the inverter option alone also claims; EV-004: so does the Wallbox control option; WALLBOX-005: and the Other wallbox control option
-    if entry.options.get(CONF_CONTROL) or entry.options.get(CONF_INVERTER) or entry.options.get(CONF_WALLBOX) or entry.options.get(CONF_OTHER_WALLBOX):
+    # BAT-008: the inverter option alone also claims; EV-004: so does the Wallbox control option; WALLBOX-005: and the Other wallbox control option;
+    # HA-021: and any whole device (its control is shared with it, D2)
+    if entry.options.get(CONF_CONTROL) or entry.options.get(CONF_INVERTER) or entry.options.get(CONF_WALLBOX) or entry.options.get(CONF_OTHER_WALLBOX) \
+            or entry.options.get(CONF_DEVICES):
         # An entry background task: HA cancels it, and the commands it started, on unload or reload.
         entry.async_create_background_task(hass, runner.run(), "SunnyHome commands")
+    if entry.options.get(CONF_DEVICES):  # HA-021: a new, changed or removed entity of a shared device reloads the entry (debounced), so the watcher follows
+        pending: list = []
+        follow = (frozenset(entry.options[CONF_DEVICES]), frozenset(watched(hass, entry)))
+        entry.async_on_unload(hass.bus.async_listen(er.EVENT_ENTITY_REGISTRY_UPDATED, partial(_registry_changed, hass, entry, follow, pending)))
+        entry.async_on_unload(lambda: pending and pending.pop()())
     return True
+
+
+@callback
+def _registry_changed(hass: HomeAssistant, entry: ConfigEntry, follow: tuple[frozenset, frozenset], pending: list, event) -> None:
+    """HA-021: an entity registry change of a ticked device (or of a watched entity, which a removal leaves no device to tell) reloads the entry
+    RELOAD_S after the last such change."""
+    devices, entities = follow
+    entity_id = event.data.get("entity_id")
+    ent = er.async_get(hass).async_get(entity_id) if entity_id else None
+    old = (event.data.get("changes") or {}).get("device_id")
+    if entity_id not in entities and (ent is None or ent.device_id not in devices) and old not in devices:
+        return
+    if pending:
+        pending.pop()()
+    pending.append(async_call_later(hass, RELOAD_S, callback(lambda _now: hass.config_entries.async_schedule_reload(entry.entry_id))))
 
 
 async def _reload(hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -299,6 +462,8 @@ async def _reload(hass: HomeAssistant, entry: ConfigEntry) -> None:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     ir.async_delete_issue(hass, DOMAIN, ISSUE)
+    for key in (ISSUE_OLD, ISSUE_TRIM):  # HA-021: raised again by the next push if still true
+        ir.async_delete_issue(hass, DOMAIN, f"{key}_{entry.entry_id}")
     return True
 
 
@@ -306,6 +471,8 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """AUTO-004: removing the integration forgets its leases; the devices stay as they are. BAT-008: an inverter lease gets a
     best-effort exit first."""
     await storage.Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.leases").async_remove()
+    await storage.Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.contract").async_remove()  # HA-021
+    hass.data.get(DOMAIN, {}).get("sent", {}).pop(entry.entry_id, None)  # HA-021: the entities the last post sent
     store = storage.Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.inverter")
     if await store.async_load() and (remote := solax_remote(hass)):
         try:
@@ -359,22 +526,69 @@ class Pusher:
         self.wallboxes_off = False  # WALLBOX-005: the same for the Other wallbox, on its own
         self.devices_off = False  # HA-016: the same for the entities' HA device names, on their own
         self.air_off = False  # HA-017: the same for a climate's fan and vane pairs, on their own
+        # HA-021: the 0.20.0 shape only after a 200 carried "contract":2 (a 200 without it switches back); safety net until the entry reloads: a 422 on
+        # a 0.20.0-shape post sends the 0.19.0 shape (hdev_off), a 413 the 0.20.0 keys uncompressed at 64/32 (caps_off)
+        self.contract = self.answered = self.hdev_off = self.caps_off = self.trimmed = False
+        # the entity ids of the last accepted 0.20.0-shape post, kept before new ones at the caps and the budget; per entry in hass.data, so they survive
+        # a reload (the debounced one a new device entity triggers included); an HA restart starts afresh
+        self.sents = hass.data.setdefault(DOMAIN, {}).setdefault("sent", {})
+        self.order: list[str] = []  # the priority of this cycle's items (explicitly ticked first), for encode's trim
+        # The contract is stored (load()): else every reload and restart would post one cycle without the whole devices, and SunnyHome ends the
+        # bindings of entities that leave the snapshot. saved: what the store holds; unconfirmed: the contract came from the store and no 200
+        # confirmed it in this run yet.
+        self.store = storage.Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.contract")
+        self.saved = self.unconfirmed = False
         self.delay = 0
         self.retry_at = 0.0
 
+    async def load(self) -> None:
+        """HA-021: starts from the stored contract (a damaged store is none)."""
+        data = await self.store.async_load()
+        self.contract = self.saved = self.unconfirmed = isinstance(data, dict) and data.get("contract") == 2
+
+    async def remember(self, contract: bool) -> None:
+        """HA-021: stores the contract (only when it changes: a 200 without it, or a refused stored one, removes it)."""
+        if contract != self.saved:
+            await (self.store.async_save({"contract": 2}) if contract else self.store.async_remove())
+        self.saved = contract
+
+    @property
+    def sent(self) -> frozenset[str]:
+        return self.sents.get(self.entry.entry_id, frozenset())
+
+    @property
+    def v2(self) -> bool:
+        """HA-021: whether the next post takes the 0.20.0 shape."""
+        return self.contract and not self.hdev_off
+
     async def tick(self, _now: datetime) -> None:
-        if self.busy or self.stopped or time.monotonic() < self.retry_at:
+        # HA-021: not before Home Assistant runs: an entity without a state yet would be left out, and SunnyHome ends the bindings of entities that
+        # leave the snapshot (whole devices widen that a lot)
+        if self.busy or self.stopped or time.monotonic() < self.retry_at or self.hass.state is not CoreState.running:
             return
-        body = self.collect()
+        v2 = self.v2
+        body = self.collect(v2)
         self.busy = True
         try:
-            await self.post(body)
+            await self.post(body, v2)
         finally:
             self.busy = False
+        self.issues()
 
-    def collect(self) -> dict:
+    def issues(self) -> None:
+        """HA-021: the repair issues of whole devices: SunnyHome is older (the 0.19.0 shape is posted, so nothing of them is sent) and a device past
+        the caps or the byte budget (the first ones by entity id are sent)."""
+        devices = bool(self.entry.options.get(CONF_DEVICES))
+        for key, raised in ((ISSUE_OLD, devices and self.answered and not self.v2), (ISSUE_TRIM, devices and self.trimmed)):
+            if raised:
+                ir.async_create_issue(self.hass, DOMAIN, f"{key}_{self.entry.entry_id}", is_fixable=False, severity=ir.IssueSeverity.WARNING, translation_key=key)
+            else:
+                ir.async_delete_issue(self.hass, DOMAIN, f"{key}_{self.entry.entry_id}")
+
+    def collect(self, v2: bool = False) -> dict:
         """Body with the shared devices; "solax" is null unless exactly one inverter integration entry exists (GW-002: a goodwe
-        entry posts "inverter" in its place; DEYE-003: so does a Deye entry with a valid serial, else "solax" stays null)."""
+        entry posts "inverter" in its place; DEYE-003: so does a Deye entry with a valid serial, else "solax" stays null).
+        HA-021: v2 is the 0.20.0 shape: the whole devices, the new keys and the 512 caps (64/32 after a 413)."""
         entries = inverter_entries(self.hass)
         if len(entries) > 1:
             ir.async_create_issue(
@@ -393,11 +607,20 @@ class Pusher:
         # SMB-004: the remote report for a SolaX plugin's hub only; SMB-007: settings also for a Growatt, Solis or Sofar hub (read only)
         profile = payload.settings_integration(info["plugin"]) if solax else None
         solax = solax and payload.solax_plugin(info["plugin"])
-        return payload.build(
-            dt_util.utcnow(), serial, readings, self.entities(), controllable(self.hass, self.entry), self.sensors(),
-            self.remote(readings) if solax else None, self.settings(hub, profile) if profile else None, domain, info, self.wallbox(),
-            None if self.wallboxes_off else self.other_wallboxes(),
+        limits = (payload.MAX_DEVICE_ENTITIES, payload.MAX_DEVICE_SENSORS) if v2 and not self.caps_off else (payload.MAX_ENTITIES, payload.MAX_SENSORS)
+        # HA-021: at the caps a new entity never pushes out one already sent (whose binding SunnyHome would end): sent ones first (a stable sort keeps
+        # the entity id order within each group), after the explicitly ticked ones
+        devices = sorted(device_entities(self.hass, self.entry), key=lambda ent: ent.entity_id not in self.sent) if v2 else []
+        explicit = {eid for key in (CONF_ENTITIES, CONF_BINARY, CONF_PEOPLE, CONF_HEAT, CONF_SENSORS) for eid in self.entry.options.get(key, [])}
+        self.trimmed = False
+        body = payload.build(
+            dt_util.utcnow(), serial, readings, self.entities(v2, devices, limits[0]), controllable(self.hass, self.entry),
+            self.sensors(v2, devices, limits[1]), self.remote(readings) if solax else None, self.settings(hub, profile) if profile else None, domain, info,
+            self.wallbox(), None if self.wallboxes_off else self.other_wallboxes(), v2, limits,
         )
+        rank = {ent.entity_id: -1 if ent.entity_id in explicit else n for n, ent in enumerate(devices)}  # a ticked entity is never trimmed before a device's
+        self.order = sorted((item["entityId"] for key in ("entities", "sensors") for item in body.get(key) or ()), key=lambda eid: rank.get(eid, -1))
+        return body
 
     def wallbox(self) -> dict | None:
         """EV-004: the EV-charger hub's envelope (readings, the work mode select, the control report), or None without one hub.
@@ -477,7 +700,7 @@ class Pusher:
         control = bool(self.entry.options.get(CONF_INVERTER)) and len(found) == len(REMOTE_KEYS)
         if not control:
             return payload.remote_report(False, state.state if state else None, max(times, default=None), None, None, None)
-        device = dr.async_get(self.hass).async_get(device_id) if device_id else None
+        device = main_device(self.hass, device_id)
         try:
             plugin = loader.async_get_loaded_integration(self.hass, SOLAX).version
         except Exception:  # noqa: BLE001 - not loaded: no plugin version, so never verified
@@ -487,63 +710,88 @@ class Pusher:
             device.model if device else None, device.sw_version if device else None,
         )
 
-    def device_of(self, ent: er.RegistryEntry) -> tuple[str | None, str | None]:
-        """HA-016: the name (the user's rename first) and manufacturer of the entity's HA device; (None, None) without one."""
-        device = dr.async_get(self.hass).async_get(ent.device_id) if ent.device_id and not self.devices_off else None
-        return (device.name_by_user or device.name, device.manufacturer) if device else (None, None)
+    def device_of(self, ent: er.RegistryEntry, v2: bool = False) -> tuple[str | None, str | None, str | None, str | None]:
+        """HA-016: the name (the user's rename first) and manufacturer of the entity's HA device; (None, None) without one. HA-021: and, for the
+        0.20.0 shape only, its registry id and model."""
+        device = dr.async_get(self.hass).async_get(ent.device_id) if ent.device_id and (v2 or not self.devices_off) else None
+        if device is None:
+            return None, None, None, None
+        main = main_device(self.hass, ent.device_id) or device  # a child device's maker and model are its parent's (deprecated on the child)
+        named = (device.name_by_user or device.name, main.manufacturer) if not self.devices_off else (None, None)
+        return (*named, *((ent.device_id, main.model) if v2 else (None, None)))
 
-    def entities(self) -> list[payload.Entity]:
-        """The ticked devices that are still shareable and in the state machine."""
-        registry = er.async_get(self.hass)
-        items, excluded = [], unshared_entries(self.hass)
-        for entity_id in self.entry.options.get(CONF_ENTITIES, [])[: payload.MAX_ENTITIES]:
-            ent = registry.async_get(entity_id)
-            if ent is None or not shareable(ent, excluded) or (state := self.hass.states.get(entity_id)) is None:
-                continue
+    def entity_of(self, ent: er.RegistryEntry, state, v2: bool) -> payload.Entity:
+        """One shared entity as payload reads it, by domain; HA-021: a config entity's category and the new climate attributes only for the 0.20.0 shape."""
+        eid, domain = ent.entity_id, ent.domain
+        device = self.device_of(ent, v2) if domain != "person" else (None, None, None, None)  # HA-016: a person has no device (home/away only)
+        category = "config" if v2 and ent.entity_category == "config" else None
+        if domain in SHARED_DOMAINS:
             modes = state.attributes.get("supported_color_modes")
-            items.append(payload.Entity(
-                entity_id, state.name, state.state, state.attributes.get("brightness"),
-                ent.domain == "light" and brightness_supported(modes), state.last_changed, None, None, None, *self.device_of(ent),
-            ))
-        if not self.states_off:  # HA-012: binary sensors, then people; only the state, never an attribute (a person has GPS and a zone)
+            return payload.Entity(eid, state.name, state.state, state.attributes.get("brightness"), domain == "light" and brightness_supported(modes),
+                                  state.last_changed, None, None, None, *device, category)
+        if domain in ("binary_sensor", "person"):  # HA-012: only the state, never an attribute (a person has GPS and a zone)
+            return payload.Entity(eid, state.name, state.state, None, False, state.last_changed,
+                                  ent.device_class or ent.original_device_class if domain == "binary_sensor" else None, None, None, *device, category)
+        if domain in payload.HEAT_DOMAINS:  # HA-013: the unit is the instance's (climate entities carry none); lastChanged is last_reported, the reading's time
+            # HA-017: after a 422 of the fan and vane pairs their lists are left out, so heat() sends none (commands still read them, seen_of);
+            # HA-021: the 0.19.0 shape leaves out the humidity, presets and range targets the same way
+            dropped = (payload.AIR_LISTS if self.air_off else frozenset()) | (frozenset() if v2 else payload.V2_ATTRS)
+            attrs = {k: v for k, v in state.attributes.items() if k not in dropped} if dropped else state.attributes
+            return payload.Entity(eid, state.name, state.state, None, False, state.last_reported, None, attrs, self.hass.config.units.temperature_unit,
+                                  *device, category)
+        # HA-021: a select or number (whole devices only)
+        return payload.Entity(eid, state.name, state.state, None, False, state.last_changed, None, state.attributes,
+                              state.attributes.get("unit_of_measurement"), *device, category)
+
+    def entities(self, v2: bool = False, devices: list | None = None, cap: int = payload.MAX_ENTITIES) -> list[payload.Entity]:
+        """The ticked devices that are still shareable and in the state machine. HA-021: then, for the 0.20.0 shape, the other entities of the whole
+        devices by entity id (an entity also ticked is sent once), up to cap: a device past it sends the first ones by entity id (trimmed)."""
+        registry = er.async_get(self.hass)
+        items, seen, excluded = [], set(), unshared_entries(self.hass)
+
+        def add(ent: er.RegistryEntry | None, rule) -> None:
+            if ent is None or ent.entity_id in seen or not rule(ent) or (state := self.hass.states.get(ent.entity_id)) is None:
+                return
+            seen.add(ent.entity_id)
+            items.append(self.entity_of(ent, state, v2))
+        for entity_id in self.entry.options.get(CONF_ENTITIES, [])[: payload.MAX_ENTITIES]:
+            add(registry.async_get(entity_id), lambda ent: shareable(ent, excluded))
+        if not self.states_off:  # HA-012: binary sensors, then people
             for key, rule in ((CONF_BINARY, lambda ent: binary_shareable(ent, excluded)), (CONF_PEOPLE, person_shareable)):
                 for entity_id in self.entry.options.get(key, [])[: payload.MAX_ENTITIES]:
-                    ent = registry.async_get(entity_id)
-                    if ent is None or not rule(ent) or (state := self.hass.states.get(entity_id)) is None:
-                        continue
-                    items.append(payload.Entity(  # HA-016: a person has no device (home/away only)
-                        entity_id, state.name, state.state, None, False, state.last_changed, ent.device_class or ent.original_device_class,
-                        None, None, *(self.device_of(ent) if key == CONF_BINARY else (None, None)),
-                    ))
-        if not self.heat_off:  # HA-013: heat pumps and boilers last; the unit is the instance's (climate entities carry none); lastChanged is last_reported, the reading's time
-            unit = self.hass.config.units.temperature_unit
+                    add(registry.async_get(entity_id), rule)
+        if not self.heat_off:  # HA-013: heat pumps and boilers last
             for entity_id in self.entry.options.get(CONF_HEAT, [])[: payload.MAX_ENTITIES]:
-                ent = registry.async_get(entity_id)
-                if ent is None or not heat_shareable(ent, excluded) or (state := self.hass.states.get(entity_id)) is None:
-                    continue
-                # HA-017: after a 422 of the fan and vane pairs their lists are left out, so heat() sends none (commands still read them, seen_of)
-                attrs = {k: v for k, v in state.attributes.items() if k not in payload.AIR_LISTS} if self.air_off else state.attributes
-                items.append(payload.Entity(
-                    entity_id, state.name, state.state, None, False, state.last_reported, None, attrs, unit, *self.device_of(ent),
-                ))
-        return items[: payload.MAX_ENTITIES]
+                add(registry.async_get(entity_id), lambda ent: heat_shareable(ent, excluded))
+        items = items[: payload.MAX_ENTITIES]
+        skipped = {"sensor"} | ({"binary_sensor"} if self.states_off else set()) | (set(payload.HEAT_DOMAINS) if self.heat_off else set())
+        for ent in devices or ():  # HA-021: whole_device applied the rules already
+            if ent.domain not in skipped:
+                add(ent, lambda ent: True)
+        self.trimmed |= len(items) > cap
+        return items[:cap]
 
-    def sensors(self) -> list[payload.Sensor] | None:
-        """The ticked sensors still shareable and in the state machine; None (no "sensors" key) while none is ticked (HA-005)."""
+    def sensors(self, v2: bool = False, devices: list | None = None, cap: int = payload.MAX_SENSORS) -> list[payload.Sensor] | None:
+        """The ticked sensors still shareable and in the state machine; None (no "sensors" key) while none is ticked (HA-005).
+        HA-021: then, for the 0.20.0 shape, the numeric sensors of the whole devices (any class, D3), their state class and Energy dashboard role."""
         ticked = self.entry.options.get(CONF_SENSORS, [])
-        if not ticked:
+        extra = [ent for ent in devices or () if ent.domain == "sensor"]
+        if not ticked and not extra:
             return None
         registry = er.async_get(self.hass)
-        items, excluded = [], unshared_entries(self.hass)
-        for entity_id in ticked[: payload.MAX_SENSORS]:
-            ent = registry.async_get(entity_id)
-            if ent is None or not sensor_shareable(ent, excluded) or (state := self.hass.states.get(entity_id)) is None:
+        items, seen, excluded, roles = [], set(), unshared_entries(self.hass), energy_roles(self.hass) if v2 else {}
+        picked = [(registry.async_get(entity_id), lambda ent: sensor_shareable(ent, excluded)) for entity_id in ticked[: payload.MAX_SENSORS]]
+        for ent, rule in picked + [(ent, lambda ent: True) for ent in extra]:  # whole_device applied the rules already
+            if ent is None or ent.entity_id in seen or not rule(ent) or (state := self.hass.states.get(ent.entity_id)) is None:
                 continue
+            seen.add(ent.entity_id)
             items.append(payload.Sensor(
-                entity_id, state.name, ent.device_class or ent.original_device_class, state.state,
-                state.attributes.get("unit_of_measurement"), state.last_reported, *self.device_of(ent),
+                ent.entity_id, state.name, ent.device_class or ent.original_device_class, state.state,
+                state.attributes.get("unit_of_measurement"), state.last_reported, *self.device_of(ent, v2),
+                state.attributes.get("state_class") if v2 else None, roles.get(ent.entity_id),
             ))
-        return items
+        self.trimmed |= len(items) > cap
+        return items[:cap]
 
     def solax(self, hub: ConfigEntry) -> tuple[str | None, list, dict]:
         """(serial, readings, plugin and manufacturer) of the profile sensors of the single solax_modbus hub. HA-008: the serial and
@@ -576,7 +824,7 @@ class Pusher:
                 continue
             if key not in keys:
                 continue
-            if serial is None and not brand and key in SERIAL_KEYS and ent.device_id and (device := devices.async_get(ent.device_id)):
+            if serial is None and not brand and key in SERIAL_KEYS and ent.device_id and (device := main_device(self.hass, ent.device_id)):
                 serial = device.serial_number
             if (state := self.hass.states.get(ent.entity_id)) is not None:
                 readings.append((key, state.attributes.get("unit_of_measurement"), state.state, state.last_reported))
@@ -619,21 +867,36 @@ class Pusher:
                 readings.append((key, state.attributes.get("unit_of_measurement"), state.state, state.last_reported))
         return serial, readings
 
-    async def post(self, body: dict) -> None:
-        """Never logs the token, payload values or device names; only counts."""
+    async def post(self, body: dict, v2: bool = False) -> None:
+        """Never logs the token, payload values or device names; only counts. HA-021: a 0.20.0-shape post (v2) goes gzip-compressed (unless caps_off),
+        with its own Content-Encoding and Content-Type and within the byte budget; every 200 tells whether SunnyHome takes that shape ("contract":2)."""
         status = None
+        packed, dropped = v2 and not self.caps_off, frozenset()
+        if packed:
+            data, dropped = await self.hass.async_add_executor_job(payload.encode, body, self.order)  # json + gzip of up to ~2 MB: never in the loop
+            self.trimmed |= bool(dropped)
+            request = {"data": data, "headers": {**self.headers, "Content-Encoding": "gzip", "Content-Type": "application/json"}}
+        else:
+            request = {"json": body, "headers": self.headers}
         try:
-            async with async_get_clientsession(self.hass).post(
-                self.url, json=body, headers=self.headers, timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
+            async with async_get_clientsession(self.hass).post(self.url, timeout=aiohttp.ClientTimeout(total=10), **request) as resp:
                 status = resp.status
                 if status == 200:
+                    try:
+                        answer = await resp.json(content_type=None)
+                    except ValueError:
+                        answer = None
+                    self.answered, self.contract, self.unconfirmed = True, isinstance(answer, dict) and answer.get("contract") == 2, False
+                    await self.remember(self.contract)
+                    if not self.contract:  # an old (rolled back) server explains the refusals: a re-deploy's contract switches back without a reload
+                        self.hdev_off = self.caps_off = False
+                    elif v2:
+                        self.sents[self.entry.entry_id] = frozenset(item["entityId"] for key in ("entities", "sensors") for item in body.get(key) or ()) - dropped
                     inverter = body.get("solax") or body.get("inverter") or {}
                     _LOGGER.debug(
-                        "Posted %d readings, %d settings, %d devices and %d sensors: %s",
+                        "Posted %d readings, %d settings, %d devices and %d sensors (%s shape): %s",
                         len(inverter.get("readings", [])), len((inverter.get("settings") or {}).get("states", {})),
-                        len(body["entities"]), len(body.get("sensors", [])),
-                        (await resp.text())[:200],
+                        len(body["entities"]), len(body.get("sensors", [])), "0.20.0" if v2 else "0.19.0", str(answer)[:200],
                     )
         except (aiohttp.ClientError, TimeoutError) as err:
             _LOGGER.debug("Post failed: %s", type(err).__name__)
@@ -643,6 +906,29 @@ class Pusher:
             self.stopped = True
             _LOGGER.warning("SunnyHome refused the token; pair again with a new code")
             self.entry.async_start_reauth(self.hass)
+        elif v2 and self.unconfirmed and status is not None and 400 <= status < 500 and status != 429:
+            # HA-021: the stored contract was refused before a 200 confirmed it (a rolled back server: 422, 413, 415, 400 ...; 401 is the token's and
+            # a 429 only a busy inflate permit): the 0.19.0 shape for the rest of this run, and the store is cleared so the next start asks again
+            self.hdev_off, self.contract, self.unconfirmed = True, False, False
+            await self.remember(False)
+            _LOGGER.warning("SunnyHome rejected a post carrying whole devices (HTTP %s), probably because its server is older; "
+                            "sending only the explicitly ticked entities until this integration is reloaded", status)
+        elif status == 422 and v2:
+            # HA-021: checked before the older flags: a server that answered "contract":2 but refuses the new shape (rolled back, or one bad item)
+            self.hdev_off = True
+            await self.remember(False)
+            _LOGGER.warning("SunnyHome rejected a post carrying whole devices (HTTP 422), probably because its server is older (or another item was refused); "
+                            "sending only the explicitly ticked entities until this integration is reloaded")
+        elif status == 413 and v2 and not packed:
+            # HA-021: still too large uncompressed at 64/32 (non-ASCII escaped, no budget): the 0.19.0 shape, which a 0.19.0 component posts too
+            self.hdev_off = True
+            await self.remember(False)
+            _LOGGER.warning("SunnyHome rejected a post carrying whole devices as too large (HTTP 413); sending only the explicitly ticked entities "
+                            "until this integration is reloaded")
+        elif status == 413 and packed:
+            self.caps_off = True
+            _LOGGER.warning("SunnyHome rejected a compressed post as too large (HTTP 413); sending at most 64 devices and 32 sensors uncompressed "
+                            "until this integration is reloaded")
         elif status == 422 and not self.air_off and any(key in e.get("heat", {}) for e in body["entities"] for key in ("fanModes", "swingModes", "swingHorizontalModes")):
             # HA-017: the newest item stops first, so a server before HA-017 (an older or rolled back one) stops only the fan and vane pairs.
             self.air_off = True
@@ -693,6 +979,7 @@ class CommandRunner:
         self.store = storage.Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.leases")
         self.leases = payload.Leases()
         self.restarted: set[str] = set()
+        self.checked: dict[str, float] = {}  # HA-021 (§2g): when the lease check first saw each due lease (the give-up time counts from it)
         self.reports: list[tuple[dict, float]] = []
         self.ticking = False
         self.off_sent: dict[str, float] = {}  # entity id -> when the last unconfirmed lease off was sent (monotonic)
@@ -728,7 +1015,7 @@ class CommandRunner:
         self.restarted = {eid for eid, _ in self.leases.due(time.time())}
         self.entry.async_on_unload(async_track_time_interval(self.hass, self.lease_tick, timedelta(seconds=LEASE_TICK_S), name="SunnyHome leases"))
         # HA's callback marks a function object; a bound method refuses the attribute (AttributeError), so wrap it.
-        self.entry.async_on_unload(async_track_state_change_event(self.hass, sorted(self.entry.options.get(CONF_CONTROL, [])[: payload.MAX_ENTITIES]),  # PLAN-031 integration: the ticked list, not the filtered one: a heat entity that blinked is still watched
+        self.entry.async_on_unload(async_track_state_change_event(self.hass, watched(self.hass, self.entry),  # HA-021: with the whole devices' controllable entities
                                                                   callback(lambda event: self.state_changed(event))))
         self.entry.async_create_background_task(self.hass, self.send_reports(), "SunnyHome lease reports")
         # BAT-008: the inverter lease survives unload, reload and restart; the tick also ends it when the option was turned off.
@@ -793,7 +1080,10 @@ class CommandRunner:
                 if eid not in controllable(self.hass, self.entry):  # the user took the device out of SunnyHome's hands: left as it is
                     await self._drop(eid, lease, "lease_cancelled", "not_controllable")
                     continue
-                if now > lease.until + (payload.HEAT_RESTORE_GIVE_UP_S if lease.target == "restore" else LEASE_GIVE_UP_S):  # ponytail: a device not seen off for a day is given up
+                # HA-021 (§2g): counted from the later of the lease end and the first check that saw it due, so a lease that ended during a long HA outage
+                # still gets its restore (or off), reported as restart
+                start = max(lease.until, self.checked.setdefault(eid, now))
+                if now > start + (payload.HEAT_RESTORE_GIVE_UP_S if lease.target == "restore" else LEASE_GIVE_UP_S):  # ponytail: a device not seen off for a day is given up
                     await self._drop(eid, lease, "lease_cancelled", None)
                     continue
                 if lease.target == "restore":  # HA-014: before the "off" test below: for a climate "off" is a mode, not the lease's end
@@ -832,8 +1122,8 @@ class CommandRunner:
             await self._drop(eid, lease, "lease_ended", "restart" if eid in self.restarted else None)
         elif reason == "lease_changed":
             return  # PLAN-031 integration: the lease was replaced while this check waited: the new one is not ours to drop
-        elif reason == "outside_change":
-            await self._drop(eid, lease, "lease_cancelled", "outside_change")
+        elif reason in ("outside_change", "restore_invalid"):  # HA-021 (§2g): a previous value that no longer validates is never written
+            await self._drop(eid, lease, "lease_cancelled", reason)
         elif eid in self.leases.items:
             self.off_sent[eid] = time.monotonic()
 
@@ -842,6 +1132,7 @@ class CommandRunner:
         await self.save()
         self.off_sent.pop(eid, None)
         self.restarted.discard(eid)
+        self.checked.pop(eid, None)
         self.report(lease.command, outcome, reason)
 
     def state_changed(self, event) -> None:
@@ -986,8 +1277,9 @@ class CommandRunner:
 
     def seen_of(self, state) -> payload.Seen:
         attrs = state.attributes
-        # HA-014: a heat entity carries heat() of its state: the target, mode, range, step and modes the component reports
-        heat = payload.heat(state.domain, state.state, attrs, self.hass.config.units.temperature_unit) if state.domain in payload.HEAT_DOMAINS else None
+        # HA-014: a heat entity carries heat() of its state: the target, mode, range, step and modes the component reports; HA-021: a select or number setting()
+        heat = (payload.heat(state.domain, state.state, attrs, self.hass.config.units.temperature_unit) if state.domain in payload.HEAT_DOMAINS
+                else payload.setting(state.domain, state.state, attrs) if state.domain in payload.SETTING_DOMAINS else None)
         return payload.Seen(
             state.state, attrs.get("brightness"),
             state.domain == "light" and brightness_supported(attrs.get("supported_color_modes")),

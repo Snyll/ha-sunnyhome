@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import logging
 import math
@@ -179,7 +180,23 @@ HEAT_LIMIT = 1000  # a number beyond it is not a temperature
 # HA-014 (0.16.0): the heat entities a command may name (the same id bounds as the readings above).
 _HEAT_ENTITY = re.compile(r"climate\.[a-z0-9_]{1,199}|water_heater\.[a-z0-9_]{1,194}")
 _STATE_ID = re.compile(r"(switch|light)\.[a-z0-9_]{1,200}|binary_sensor\.[a-z0-9_]{1,193}|person\.[a-z0-9_]{1,200}"
-                       r"|climate\.[a-z0-9_]{1,199}|water_heater\.[a-z0-9_]{1,194}")
+                       r"|climate\.[a-z0-9_]{1,199}|water_heater\.[a-z0-9_]{1,194}|(select|number)\.[a-z0-9_]{1,200}")
+# HA-021 (0.20.0): the shape a server that answers "contract":2 takes (HA-019). Whole devices add selects and numbers (their own kinds), the HA device
+# id and model, a config entity's category, a sensor's state class and Energy dashboard role, and a climate's humidity, presets and range targets.
+SETTING_DOMAINS = frozenset({"select", "number"})
+_SETTING_ENTITY = re.compile(r"(select|number)\.[a-z0-9_]{1,200}")
+MAX_DEVICE_ENTITIES = MAX_DEVICE_SENSORS = 512  # the server's caps for the 0.20.0 shape (HomeAssistantEntities.MAXIMUM, SENSORS)
+# The server inflates at most 2 MiB and takes at most 256 KiB compressed (HA-019 post review; the spec's 512 KiB was lowered): a body stays under both.
+GZIP_BUDGET, JSON_BUDGET = 240 * 1024, 2_000_000
+MAX_OPTIONS, MAX_OPTION_TEXT = 32, 64
+NUMBER_LIMIT = 1_000_000
+MAX_PRESETS = 16
+PRESET = ("preset_mode", "preset_modes", "presetMode", "presetModes")
+V2_ATTRS = frozenset({"current_humidity", "preset_modes", "target_temp_low", "target_temp_high"})  # left out of a 0.19.0-shape post
+_DEVICE_ID = re.compile(r"[0-9a-f]{32}")
+ANY_CLASS = re.compile(r"[a-z0-9_]{1,32}")
+STATE_CLASSES = frozenset({"measurement", "total", "total_increasing"})
+ENERGY_ROLES = ("grid", "solar", "battery")
 # HA-005: picked sensors. The server's rules again (one item outside them refuses the whole post): the id within the rule bound
 # (64 characters), these device classes (HA-011: battery, voltage, current, humidity, gas and water added; gas and water are meter totals like
 # energy), at most 32, state and unit lengths counted like the server (UTF-16 code units).
@@ -251,6 +268,9 @@ class Entity(NamedTuple):
     unit: str | None = None  # HA-013: the temperature unit of the HA instance (hass.config.units.temperature_unit); climate entities carry none
     device: str | None = None  # HA-016: the name of the entity's HA device (none for a person)
     maker: str | None = None  # HA-016: that device's manufacturer
+    device_id: str | None = None  # HA-021: the HA device registry id (only for a 0.20.0-shape post)
+    model: str | None = None  # HA-021: that device's model
+    category: str | None = None  # HA-021: "config" for a config entity (only for a 0.20.0-shape post)
 
 
 def _short(text: object) -> str | None:
@@ -259,10 +279,69 @@ def _short(text: object) -> str | None:
     return text if text and text.isprintable() and _utf16(text) <= MAX_NAME else None
 
 
-def _device(device: str | None, maker: str | None) -> dict:
-    """HA-016: "deviceName" and "manufacturer" of an entity's HA device, only when it has a usable name (the picker groups by it)."""
+def _device(device: str | None, maker: str | None, device_id: str | None = None, model: str | None = None) -> dict:
+    """HA-016: "deviceName" and "manufacturer" of an entity's HA device, only when it has a usable name (the picker groups by it).
+    HA-021: "deviceId" whenever the entity has a device, whatever its name, and "model" only with it."""
     name = _short(device)
-    return {"deviceName": name, "manufacturer": _short(maker)} if name else {}
+    item = {"deviceName": name, "manufacturer": _short(maker)} if name else {}
+    if isinstance(device_id, str) and _DEVICE_ID.fullmatch(device_id):
+        item["deviceId"] = device_id
+        if model := _short(model):
+            item["model"] = model
+    return item
+
+
+def _option_text(value: object) -> str | None:
+    """HA-021: a select option (or its state) as the server bounds it: printable text of 1-64 UTF-16 units, else None."""
+    return value if isinstance(value, str) and value and value.isprintable() and _utf16(value) <= MAX_OPTION_TEXT else None
+
+
+def _number(value: object) -> float | None:
+    """HA-021: a number entity's value, bound or step: finite and within ±NUMBER_LIMIT (never a bool), else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or abs(value) > NUMBER_LIMIT or not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def setting(domain: str, state: str, attributes: Mapping | None) -> dict:
+    """HA-021: what a select or number shows, sanitised to the server's rules: a select's option and options (at most MAX_OPTIONS distinct), a number's
+    value, min, max and step (a range with min > max or a step <= 0 is None: such a number is neither sent nor commanded). Also the Seen of a command."""
+    live = state not in ("unavailable", "unknown")
+    attributes = attributes or {}
+    if domain == "select":
+        listed = attributes.get("options")
+        options = list(dict.fromkeys(o for o in listed if _option_text(o)))[:MAX_OPTIONS] if isinstance(listed, (list, tuple)) else []
+        return {"option": _option_text(state) if live else None, "options": options}
+    low, high, step = (_number(attributes.get(key)) for key in ("min", "max", "step"))
+    if low is None or high is None or low > high:
+        low = high = None
+    try:
+        value = _number(float(state)) if live else None
+    except (TypeError, ValueError):
+        value = None
+    return {"value": value, "min": low, "max": high, "step": step if step is not None and step > 0 else None}
+
+
+def energy_roles(prefs: object) -> dict[str, str]:
+    """HA-021 (D6): {statistic id: grid | solar | battery} of the Energy dashboard's sources (stat_energy_* and stat_rate*: energy and power, never money);
+    the caller matches entity ids only, so an external statistic ("shelly:...") never matches."""
+    roles: dict[str, str] = {}
+
+    def walk(node: object, role: str) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if isinstance(value, str) and key.startswith(("stat_energy_", "stat_rate")):
+                    roles.setdefault(value, role)
+                else:
+                    walk(value, role)
+        elif isinstance(node, (list, tuple)):
+            for value in node:
+                walk(value, role)
+    sources = prefs.get("energy_sources") if isinstance(prefs, Mapping) else None
+    for source in sources if isinstance(sources, (list, tuple)) else ():
+        if isinstance(source, Mapping) and source.get("type") in ENERGY_ROLES:
+            walk(source, source["type"])
+    return roles
 
 
 def _name(name: str | None, entity_id: str) -> str:
@@ -294,7 +373,7 @@ def heat(domain: str, state: str, attributes: Mapping | None, unit: str | None) 
     which is hvac_mode or the operation mode), the available modes (at most MAX_HEAT_MODES), a climate's hvac_action and the unit. Sanitised so the
     server never refuses it: a bad number is None, a range with min > max loses both ends, a step <= 0 is the default (0.5 for °C, 1 for °F), a
     mode that is not printable text of at most 32 characters is dropped. An unavailable or unknown entity reports no values at all. A dual setpoint
-    (target_temp_low and target_temp_high without a temperature) has no target here and stays read only (HA-014)."""
+    (target_temp_low and target_temp_high without a temperature) has no target here; HA-021 reports and controls it through targetLow/targetHigh."""
     live = state not in ("unavailable", "unknown")
     attributes = attributes if live and attributes else {}
     unit = unit if unit in ("°C", "°F") else "°C"
@@ -313,16 +392,45 @@ def heat(domain: str, state: str, attributes: Mapping | None, unit: str | None) 
         "action": _heat_text(attributes.get("hvac_action")) if domain == "climate" else None,
         "unit": unit,
     }
-    for attr, list_attr, key, list_key in AIR if domain == "climate" else ():  # HA-017: only the pairs HA reports a usable list for
+    for attr, list_attr, key, list_key in (*AIR, PRESET) if domain == "climate" else ():  # HA-017: only the pairs HA reports a usable list for (HA-021: presets too)
         listed = attributes.get(list_attr)
         values = list(dict.fromkeys(m for m in listed if _heat_text(m)))[:MAX_AIR_MODES] if isinstance(listed, (list, tuple)) else []
         if values:
             result[key], result[list_key] = _heat_text(attributes.get(attr)), values
+    if domain == "climate":  # HA-021: the humidity (0-100) and the range targets (both, low <= high), only when HA reports them (the caller strips them for 0.19.0)
+        humidity = _heat_number(attributes.get("current_humidity"))
+        if humidity is not None and 0 <= humidity <= 100:
+            result["humidity"] = humidity
+        if "target_temp_low" in attributes and "target_temp_high" in attributes:
+            low, high = _heat_number(attributes["target_temp_low"]), _heat_number(attributes["target_temp_high"])
+            result["targetLow"], result["targetHigh"] = (None, None) if low is not None and high is not None and low > high else (low, high)
     return result
 
 
-def _entity(e: Entity, control: Collection[str]) -> dict:
+def _entity(e: Entity, control: Collection[str]) -> dict | None:
     domain = e.entity_id.split(".", 1)[0]
+    device = {**_device(e.device, e.maker, e.device_id, e.model), **({"entityCategory": "config"} if e.category == "config" else {})}
+    if domain in SETTING_DOMAINS:  # HA-021: a select or number of a whole device; one the server would refuse (no options, no range) is not sent
+        shown = setting(domain, e.state, e.attributes)
+        if domain == "select" and not shown["options"] or domain == "number" and (shown["min"] is None or shown["step"] is None):
+            return None
+        item = {
+            "entityId": e.entity_id,
+            "domain": domain,
+            "name": _name(e.name, e.entity_id),
+            "state": e.state if _option_text(e.state) else "unknown",
+            "brightness": None,
+            "supportsBrightness": False,
+            "lastChanged": _iso(e.last_changed) if e.last_changed else None,
+            "kind": domain,
+            **({"options": shown["options"]} if domain == "select" else {
+                "value": shown["value"], "min": shown["min"], "max": shown["max"], "step": shown["step"],
+                "unit": e.unit if isinstance(e.unit, str) and _utf16(e.unit) <= MAX_UNIT else None}),
+            **device,
+        }
+        if control:
+            item["controllable"] = e.entity_id in control
+        return item
     if domain in HEAT_DOMAINS:  # HA-013: read only like a binary sensor; lastChanged is the reading's own time (last_reported), see Pusher.entities
         state = e.state if _heat_text(e.state) else "unknown"
         item = {
@@ -335,7 +443,7 @@ def _entity(e: Entity, control: Collection[str]) -> dict:
             "lastChanged": _iso(e.last_changed) if e.last_changed else None,
             "kind": domain,
             "heat": heat(domain, state, e.attributes, e.unit),
-            **_device(e.device, e.maker),
+            **device,
         }
         if control:  # HA-014: the component decides it (the control tick and TARGET_TEMPERATURE), see controllable()
             item["controllable"] = e.entity_id in control
@@ -354,7 +462,7 @@ def _entity(e: Entity, control: Collection[str]) -> dict:
         }
         if not person:
             item["deviceClass"] = e.device_class
-            item.update(_device(e.device, e.maker))
+            item.update(device)
         if control:
             item["controllable"] = False
         return item
@@ -369,7 +477,7 @@ def _entity(e: Entity, control: Collection[str]) -> dict:
         "brightness": None if level is None else min(100, max(0, round(level * 100 / 255))),
         "supportsBrightness": supports,
         "lastChanged": _iso(e.last_changed) if e.last_changed else None,
-        **_device(e.device, e.maker),
+        **device,
     }
     if control:  # expand -> contract: the 8th key only while there is a control list (an HA-002 backend takes 7)
         item["controllable"] = e.entity_id in control
@@ -387,6 +495,10 @@ class Sensor(NamedTuple):
     last_reported: datetime
     device: str | None = None  # HA-016
     maker: str | None = None
+    device_id: str | None = None  # HA-021: only for a 0.20.0-shape post
+    model: str | None = None
+    state_class: str | None = None  # HA-021: measurement, total or total_increasing
+    energy_role: str | None = None  # HA-021 (D6): grid, solar or battery when the Energy dashboard uses the sensor
 
 
 def _utf16(text: str) -> int:
@@ -394,24 +506,31 @@ def _utf16(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
-def _sensors(sensors: Sequence[Sensor]) -> list[dict]:
-    """The sensor items the server accepts: valid ids once, the three classes, bounded state and unit, at most 32."""
+def _sensors(sensors: Sequence[Sensor], v2: bool = False, cap: int = MAX_SENSORS) -> list[dict]:
+    """The sensor items the server accepts: valid ids once, the three classes, bounded state and unit, at most 32.
+    HA-021: the 0.20.0 shape takes any class of [a-z0-9_]{1,32} or none, the state class and the Energy dashboard role, and up to cap."""
     items, seen = [], set()
     for s in sensors:
-        if not SENSOR_ID.fullmatch(s.entity_id) or s.device_class not in SENSOR_CLASSES or s.entity_id in seen:
+        if not SENSOR_ID.fullmatch(s.entity_id) or s.entity_id in seen \
+                or not (s.device_class is None or ANY_CLASS.fullmatch(s.device_class) if v2 else s.device_class in SENSOR_CLASSES):
             continue
         seen.add(s.entity_id)
         state = str(s.state)
-        items.append({
+        item = {
             "entityId": s.entity_id,
             "name": _name(s.name, s.entity_id),
             "deviceClass": s.device_class,
             "state": state if _utf16(state) <= MAX_STATE else "unknown",
             "unit": s.unit if isinstance(s.unit, str) and _utf16(s.unit) <= MAX_UNIT else None,
             "lastReported": _iso(s.last_reported),
-            **_device(s.device, s.maker),
-        })
-    return items[:MAX_SENSORS]
+            **_device(s.device, s.maker, s.device_id, s.model),
+        }
+        if s.state_class in STATE_CLASSES:
+            item["stateClass"] = s.state_class
+        if s.energy_role in ENERGY_ROLES:
+            item["energyRole"] = s.energy_role
+        items.append(item)
+    return items[:cap]
 
 
 def settings(integration: str, states: Mapping[str, str]) -> dict | None:
@@ -461,6 +580,8 @@ def build(
     hub_info: dict | None = None,
     wallbox: dict | None = None,
     wallboxes: list[dict] | None = None,
+    v2: bool = False,
+    limits: tuple[int, int] = (MAX_ENTITIES, MAX_SENSORS),
 ) -> dict:
     """Body of POST /api/ha/v1/states.
 
@@ -475,6 +596,8 @@ def build(
     hub_info is the hub's plugin and manufacturer (HA-008, see hub()), sent beside the readings of a solax_modbus hub.
     wallbox is the EV-charger hub's envelope (EV-004, see wallbox_report()), sent beside either inverter key.
     wallboxes is the list of the Other wallbox item (WALLBOX-005, see generic_report()), sent beside "wallbox".
+    HA-021: v2 is the 0.20.0 shape (sensors of any class); limits are the entity and sensor caps (64/32, or 512/512 for a gzip post). The caller passes
+    the new keys and kinds only for that shape.
     """
     solax = None if readings is None else {
         "serial": serial,
@@ -483,10 +606,10 @@ def build(
             for key, unit, state, reported in readings[:MAX_READINGS]
         ],
     }
-    items = [_entity(e, control) for e in entities if _STATE_ID.fullmatch(e.entity_id)
-             and (e.device_class in BINARY_CLASSES or not e.entity_id.startswith("binary_sensor."))]
+    items = [item for e in entities if _STATE_ID.fullmatch(e.entity_id) and (e.device_class in BINARY_CLASSES or not e.entity_id.startswith("binary_sensor."))
+             and (item := _entity(e, control)) is not None][:limits[0]]
     if solax is not None and integration != "solax_modbus":
-        body = {"sentAt": _iso(sent_at), "inverter": {"integration": integration, **solax}, "entities": items[:MAX_ENTITIES]}
+        body = {"sentAt": _iso(sent_at), "inverter": {"integration": integration, **solax}, "entities": items}
     else:
         if solax is not None and remote is not None:
             solax["remote"] = remote
@@ -494,14 +617,33 @@ def build(
             solax["settings"] = hub_settings
         if solax is not None and hub_info is not None:
             solax.update(hub_info)
-        body = {"sentAt": _iso(sent_at), "solax": solax, "entities": items[:MAX_ENTITIES]}
+        body = {"sentAt": _iso(sent_at), "solax": solax, "entities": items}
     if sensors is not None:  # expand -> contract: only while sensors are ticked (a backend before HA-005 refuses the key)
-        body["sensors"] = _sensors(sensors)
+        body["sensors"] = _sensors(sensors, v2, limits[1])
     if wallbox is not None:  # EV-004: only with an EV-charger hub (a backend before EV-004 refuses a solax_modbus wallbox)
         body["wallbox"] = wallbox
     if wallboxes is not None:  # WALLBOX-005: only with an Other wallbox set up (a backend before it refuses the key)
         body["wallboxes"] = wallboxes
     return body
+
+
+def encode(body: dict, order: Sequence[str] | None = None, gzip_budget: int = GZIP_BUDGET, json_budget: int = JSON_BUDGET) -> tuple[bytes, frozenset]:
+    """HA-021: the gzip bytes of a 0.20.0-shape post (UTF-8 JSON, not escaped: aiohttp's json= would make each non-ASCII character 6 bytes) and
+    the entity ids trimmed: over a budget, the items last in order (the priority, most important first: the explicitly ticked ones, then the whole
+    devices' entities sent before, then new ones; by default the entity ids) go first, a tenth at a time, so the server never refuses the post for its
+    size."""
+    dropped: frozenset = frozenset()
+    while True:
+        raw = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
+        data = gzip.compress(raw, compresslevel=6, mtime=0)
+        present = {item["entityId"] for key in ("entities", "sensors") for item in body.get(key) or ()}
+        rank = {eid: n for n, eid in enumerate(order if order is not None else sorted(present))}
+        ids = sorted(present, key=lambda eid: rank.get(eid, len(rank)))  # an id outside the order goes first
+        if len(raw) <= json_budget and len(data) <= gzip_budget or not ids:
+            return data, dropped
+        drop = frozenset(ids[-max(1, len(ids) // 10):])
+        body = {**body, **{key: [item for item in body[key] if item["entityId"] not in drop] for key in ("entities", "sensors") if key in body}}
+        dropped |= drop
 
 
 # Commands (HA-003): POST /api/ha/v1/commands/claim and /commands/result. AUTO-004 (0.3.0): a claim with the X-SunnyHome-Leases
@@ -517,7 +659,16 @@ _LEASED_KEYS = _COMMAND_KEYS | {"leaseS"}
 # HA-014: a command on a heat entity, whatever its action, has this shape; value and mode are null where the action has none.
 _HEAT_KEYS = _COMMAND_KEYS | {"value", "mode"}
 _HEAT_LEASED_KEYS = _HEAT_KEYS | {"leaseS"}
+# HA-021 (0.20.0): selects, numbers, presets and range targets take the heat shape too; a 0.20.0 claimer may also get "valueHigh" (a range's high
+# target, else null), with or without a lease. Both shapes are accepted, whichever the server sends.
+_HEAT_SHAPES = (_HEAT_KEYS, _HEAT_LEASED_KEYS, _HEAT_KEYS | {"valueHigh"}, _HEAT_LEASED_KEYS | {"valueHigh"})
 HEAT_ACTIONS = ("set_temperature", "set_mode")
+SETTING_ACTIONS = {"select": "select_option", "number": "set_value"}  # HA-021: the one action of each kind (the option rides in mode, the number in value)
+# HA-021 (§2g): what a restore lease holds, per key: the field of Seen.heat it compares (a select's and a number's Seen.heat is setting()).
+_FIELDS = {"temperature": "target", "mode": "mode", "preset": "presetMode", "low": "targetLow", "high": "targetHigh", "option": "option", "value": "value"}
+_TEXT_KEYS = frozenset({"mode", "preset", "option"})
+_HEAT_SPEC = frozenset({"temperature", "mode"})  # a climate's or water heater's lease always has these two (the 0.19.0 store shape); the rest only when set
+_BACK_REQUIRED = frozenset({"option", "value", "preset", "low", "high"})  # HA-021 (§2g): a leased grant of these needs a previous value to put back
 # HA-017: a climate's fan / vane commands: the value rides in mode (the _HEAT_KEYS shape), never leased; action -> (value key, list key, service field).
 AIR_ACTIONS = {"set_fan_mode": ("fanMode", "fanModes", "fan_mode"),
                "set_swing_mode": ("swingMode", "swingModes", "swing_mode"),
@@ -535,8 +686,10 @@ class Command(NamedTuple):
     level: int | None  # 1-100 for level, else None
     ttl_ms: int
     lease_s: int | None = None  # AUTO-004: the lease of an automation on/level, or the renewal's length
-    value: float | None = None  # HA-014: set_temperature's target (a restore: the previous target to put back)
-    mode: str | None = None  # HA-014: set_mode's mode, or set_temperature's optional mode (a restore: the previous mode)
+    value: float | None = None  # HA-014: set_temperature's target (a restore: the previous target to put back); HA-021: a range's low, set_value's number
+    mode: str | None = None  # HA-014: set_mode's mode, or set_temperature's optional mode (a restore: the previous mode); HA-021: the option or preset
+    value_high: float | None = None  # HA-021: a range set_temperature's high target
+    back: dict | None = None  # HA-021: a restore's values per lease key (heat_verdict), which service_calls and reached read
 
 
 class Seen(NamedTuple):
@@ -569,24 +722,42 @@ def is_heat(entity_id: object) -> bool:
     return isinstance(entity_id, str) and _HEAT_ENTITY.fullmatch(entity_id) is not None
 
 
+def is_setting(entity_id: object) -> bool:
+    """HA-021: a select or number entity (commanded and leased in the heat shape)."""
+    return isinstance(entity_id, str) and _SETTING_ENTITY.fullmatch(entity_id) is not None
+
+
+def restorable(entity_id: object) -> bool:
+    """HA-021: an entity whose rule changes are held by a restore lease (heat, select, number); a switch or light keeps the on/off lease."""
+    return is_heat(entity_id) or is_setting(entity_id)
+
+
 def parse_command(item: object) -> tuple[str | None, Command | None]:
     """Strict check of one claimed command: (id, command); command None if invalid, id None if the id is."""
     if not isinstance(item, dict) or not isinstance(cid := item.get("id"), str) or not _UUID.fullmatch(cid):
         return None, None
     entity_id, action, level, ttl, lease = (item.get(key) for key in ("entityId", "action", "level", "ttlMs", "leaseS"))
     leasing = type(lease) is int and LEASE_MIN_S <= lease <= LEASE_MAX_S
-    if is_heat(entity_id):  # HA-014: set_temperature (a lease and a mode are optional), set_mode and the lease renewal and cancel; never on, off or level
-        value, mode = item.get("value"), item.get("mode")
+    if restorable(entity_id):  # HA-014: set_temperature (a lease and a mode are optional), set_mode and the lease renewal and cancel; never on, off or level
+        value, mode, high = item.get("value"), item.get("mode"), item.get("valueHigh")
+        climate = entity_id.startswith("climate.")
+        own = SETTING_ACTIONS.get(entity_id.split(".", 1)[0])  # HA-021: a select's select_option, a number's set_value; None for a heat entity
+        low_n, high_n = _heat_number(value), _heat_number(high)
         valid = (
-            item.keys() in (_HEAT_KEYS, _HEAT_LEASED_KEYS) and level is None and type(ttl) is int and ttl >= 0
-            and (action == "set_temperature" and _heat_number(value) is not None and (mode is None or _heat_text(mode) is not None) and (lease is None or leasing)
-                 or action == "set_mode" and value is None and _heat_text(mode) is not None and lease is None
-                 or action in AIR_ACTIONS and entity_id.startswith("climate.") and value is None and _heat_text(mode) is not None and lease is None
+            item.keys() in _HEAT_SHAPES and level is None and type(ttl) is int and ttl >= 0
+            and (high is None or action == "set_temperature" and climate and low_n is not None and high_n is not None and low_n <= high_n)  # HA-021 (D7): a range
+            and (own is None and action == "set_temperature" and low_n is not None and (mode is None or _heat_text(mode) is not None) and (lease is None or leasing)
+                 or own is None and action == "set_mode" and value is None and _heat_text(mode) is not None and lease is None
+                 or action in AIR_ACTIONS and climate and value is None and _heat_text(mode) is not None and lease is None
+                 # HA-021: a preset (climate), an option (select) or a number (number), each with an optional lease
+                 or action == "set_preset_mode" and climate and value is None and _heat_text(mode) is not None and (lease is None or leasing)
+                 or action == "select_option" == own and value is None and _option_text(mode) is not None and (lease is None or leasing)
+                 or action == "set_value" == own and _number(value) is not None and mode is None and (lease is None or leasing)
                  or action == "lease_renew" and value is None and mode is None and leasing
                  or action == "lease_cancel" and value is None and mode is None and lease is None)
         )
-        value = _heat_number(value) if action == "set_temperature" else None
-        return cid, (Command(cid, entity_id, action, None, ttl, lease, value, mode) if valid else None)
+        value = low_n if action == "set_temperature" else _number(value) if action == "set_value" else None
+        return cid, (Command(cid, entity_id, action, None, ttl, lease, value, mode, high_n) if valid else None)
     valid = (
         item.keys() in (_COMMAND_KEYS, _LEASED_KEYS)
         and isinstance(entity_id, str) and _ENTITY_ID.fullmatch(entity_id) is not None
@@ -618,37 +789,71 @@ def _near(shown: object, want: float, step: object) -> bool:
 
 
 def _shows(key: str, want: object, heat: dict) -> bool:
-    return heat.get("mode") == want if key == "mode" else _near(heat.get("target"), want, heat.get("step"))
+    shown = heat.get(_FIELDS[key])
+    if key == "preset" and want == "none" and shown is None:
+        return True  # HA-021 (§2g): no preset active, as many climates report it
+    if key == "value":  # HA-021: a number shows exactly what was set (a previous value may sit off the step grid, so half a step is too loose)
+        return isinstance(shown, (int, float)) and abs(shown - want) <= 1e-6 * max(1.0, abs(want))
+    return shown == want if key in _TEXT_KEYS else _near(shown, want, heat.get("step"))
 
 
 def heat_shows(spec: dict | None, seen: Seen | None) -> bool:
-    """HA-014: whether the entity shows every value the spec holds ({"temperature", "mode"}; a None key is not held)."""
+    """HA-014: whether the entity shows every value the spec holds ({"temperature", "mode"}; a None key is not held). HA-021: also preset, low, high,
+    option and value (_FIELDS)."""
     if seen is None or seen.heat is None or spec is None:
         return False
     return all(_shows(key, want, seen.heat) for key, want in spec.items() if want is not None)
 
 
 def _final_mode(cmd: Command, seen: Seen | None) -> str | None:
-    """The hvac (operation) mode the entity ends in; HA-017: a fan / vane command's mode is its value, so it leaves the mode as shown."""
-    own = cmd.mode if cmd.action not in AIR_ACTIONS else None
+    """The hvac (operation) mode the entity ends in; HA-017: a fan / vane command's mode is its value, so it leaves the mode as shown (HA-021: so does
+    a preset's or an option's)."""
+    own = cmd.mode if cmd.action in ("set_temperature", "set_mode", "restore") else None
     return own if own is not None else seen.heat.get("mode") if seen is not None and seen.heat is not None else None
+
+
+def _sets(cmd: Command, seen: Seen | None) -> dict:
+    """HA-021: the values a command leaves on the entity, per lease key (_FIELDS); None where it sets nothing. A target (single or range) is not set
+    when the resulting mode is off (service_calls sends none then)."""
+    if cmd.action in SETTING_ACTIONS.values():
+        return {"option": cmd.mode} if cmd.action == "select_option" else {"value": cmd.value}
+    if cmd.action == "set_preset_mode":
+        return {"preset": cmd.mode}
+    off = _final_mode(cmd, seen) == "off"
+    if cmd.action == "restore":
+        back = dict(cmd.back) if cmd.back is not None else {"temperature": cmd.value, "mode": cmd.mode}
+        return {key: None if off and key in ("temperature", "low", "high") else want for key, want in back.items()}
+    if cmd.value_high is not None:
+        return {"mode": cmd.mode, "low": None if off else cmd.value, "high": None if off else cmd.value_high}
+    return {"temperature": None if off else cmd.value, "mode": cmd.mode}
 
 
 def service_calls(cmd: Command, seen: Seen | None) -> list[tuple[str, str, dict]]:
     """The service calls of one command: one for a switch or light; for a heat entity the mode first (not when it is already shown), then the
-    temperature (not when the resulting mode is off: many integrations refuse a setpoint then). An empty list: nothing to call."""
-    if not is_heat(cmd.entity_id):
+    temperature (not when the resulting mode is off: many integrations refuse a setpoint then). An empty list: nothing to call.
+    HA-021: select_option and set_value one call each; set_preset_mode one call; a range target is one set_temperature with both ends; a restore
+    puts its values back in the same order (mode, preset, then the target or the range)."""
+    if not restorable(cmd.entity_id):
         return [service_call(cmd)]
     domain = cmd.entity_id.split(".", 1)[0]
     data = {"entity_id": cmd.entity_id}
     if cmd.action in AIR_ACTIONS:  # HA-017: one call, never the hvac mode or the temperature
         return [(domain, cmd.action, {**data, AIR_ACTIONS[cmd.action][2]: cmd.mode})]
+    wanted = _sets(cmd, seen)
+    if domain in SETTING_DOMAINS:
+        key = "option" if domain == "select" else "value"
+        return [] if wanted.get(key) is None else [(domain, SETTING_ACTIONS[domain], {**data, key: wanted[key]})]
     calls = []
-    if cmd.mode is not None and cmd.mode != (seen.heat.get("mode") if seen is not None and seen.heat is not None else None):
+    mode = wanted.get("mode")
+    if mode is not None and mode != (seen.heat.get("mode") if seen is not None and seen.heat is not None else None):
         calls.append((domain, "set_hvac_mode" if domain == "climate" else "set_operation_mode",
-                      {**data, "hvac_mode" if domain == "climate" else "operation_mode": cmd.mode}))
-    if cmd.value is not None and _final_mode(cmd, seen) != "off":
-        calls.append((domain, "set_temperature", {**data, "temperature": cmd.value}))
+                      {**data, "hvac_mode" if domain == "climate" else "operation_mode": mode}))
+    if wanted.get("preset") is not None:
+        calls.append((domain, "set_preset_mode", {**data, "preset_mode": wanted["preset"]}))
+    target = {field: wanted[key] for key, field in (("temperature", "temperature"), ("low", "target_temp_low"), ("high", "target_temp_high"))
+              if wanted.get(key) is not None}
+    if target:
+        calls.append((domain, "set_temperature", {**data, **target}))
     return calls
 
 
@@ -663,23 +868,25 @@ def _chain(dispatch: Callable, calls: list) -> asyncio.Future:
     return asyncio.ensure_future(rest())
 
 
-def in_range(value: float, heat: dict) -> bool:
-    """HA-014: within the entity's own min and max (both known) and on its step grid (value / step whole, or exactly min or max)."""
+def in_range(value: float, heat: dict, from_min: bool = False) -> bool:
+    """HA-014: within the entity's own min and max (both known) and on its step grid (value / step whole, or exactly min or max). HA-021: a number's
+    grid counts from its min (from_min, as the server's onGrid does for set_value), a heat target's from 0."""
     low, high, step = heat.get("min"), heat.get("max"), heat.get("step")
     if low is None or high is None or not isinstance(step, (int, float)) or step <= 0:
         return False
-    cells = value / step
+    cells = (value - low if from_min else value) / step
     return low - 1e-9 <= value <= high + 1e-9 and (abs(cells - round(cells)) <= 1e-6 or abs(value - low) <= 1e-9 or abs(value - high) <= 1e-9)
 
 
 def reached(cmd: Command, seen: Seen | None) -> bool:
-    """The target state: on or off; for a level on with the brightness within 1 %; HA-014: the target and mode of a heat command."""
+    """The target state: on or off; for a level on with the brightness within 1 %; HA-014: the target and mode of a heat command (HA-021: and what a
+    select, number, preset, range or restore command sets)."""
     if seen is None:
         return False
     if cmd.action in AIR_ACTIONS:  # HA-017
         return seen.heat is not None and seen.heat.get(AIR_ACTIONS[cmd.action][0]) == cmd.mode
-    if is_heat(cmd.entity_id):
-        return heat_shows({"temperature": cmd.value if _final_mode(cmd, seen) != "off" else None, "mode": cmd.mode}, seen)
+    if restorable(cmd.entity_id):
+        return heat_shows(_sets(cmd, seen), seen)
     if cmd.action != "level":
         return seen.state == cmd.action
     b = seen.brightness
@@ -706,6 +913,7 @@ async def execute(cmd: Command, until: float, env: Env) -> tuple[str, str | None
     AUTO-004: a leased on/level records its lease (saved) before its checks and drops it again when refused;
     every other command for the entity ends the entity's lease; lease_renew and lease_cancel call no service.
     HA-014: a leased set_temperature records a restore lease (the previous target and mode, read first, and the values it sets).
+    HA-021 (§2g): so does a leased select_option, set_value, set_preset_mode or range set_temperature (per key: option, value, preset, low and high).
     """
     eid = cmd.entity_id
     async with env.locks.setdefault(eid, asyncio.Lock()):
@@ -717,7 +925,7 @@ async def execute(cmd: Command, until: float, env: Env) -> tuple[str, str | None
         before = env.leases.items.get(eid) if env.leases is not None else None
         if env.leases is not None:
             if leased:
-                if is_heat(eid):
+                if restorable(eid):
                     # The previous values are read before anything is written; an entity that shows none gets no lease (and is refused below).
                     if (seen := env.state(eid)) is not None and seen.heat is not None and seen.state not in _UNAVAILABLE:
                         env.leases.grant_restore(eid, cmd, seen, env.wall())
@@ -729,6 +937,9 @@ async def execute(cmd: Command, until: float, env: Env) -> tuple[str, str | None
                 await env.save()
         # No await from here to the dispatch: the checks hold when the call starts.
         refusal = _refusal(cmd, until, env)
+        if refusal is None and leased and restorable(eid) and (lease := env.leases.items.get(eid)) is not None and lease.command == cmd.id \
+                and any(lease.prev.get(key) is None for key, want in lease.set.items() if want is not None and key in _BACK_REQUIRED):
+            refusal = "restore_invalid"  # HA-021 (§2g): nothing to put back at the lease end, so the rule's value would stay
         task = None
         if refusal is None:
             try:
@@ -742,7 +953,7 @@ async def execute(cmd: Command, until: float, env: Env) -> tuple[str, str | None
                 refusal = "service_error"
         if refusal is not None:
             if leased:
-                if before is not None and is_heat(eid):
+                if before is not None and restorable(eid):
                     env.leases.items[eid] = before  # the earlier restore lease still holds the real previous values
                 else:
                     env.leases.cancel(eid)
@@ -767,6 +978,15 @@ async def _watch(cmd: Command, task: asyncio.Future | None, env: Env) -> tuple[s
     return "unknown", "service_error", False  # the call failed after it started (e.g. ServiceValidationError)
 
 
+def _actions(eid: str) -> tuple[str, ...]:
+    """The actions an entity takes (a restore is the lease end's own command)."""
+    if is_heat(eid):
+        return (*HEAT_ACTIONS, *AIR_ACTIONS, "restore") + (("set_preset_mode",) if eid.startswith("climate.") else ())
+    if is_setting(eid):
+        return SETTING_ACTIONS[eid.split(".", 1)[0]], "restore"
+    return "on", "off", "level"
+
+
 def _refusal(cmd: Command, until: float, env: Env) -> str | None:
     """Why a command is refused before any service call, or None."""
     eid = cmd.entity_id
@@ -777,15 +997,24 @@ def _refusal(cmd: Command, until: float, env: Env) -> str | None:
     seen = env.state(eid)
     if seen is None or seen.state in _UNAVAILABLE:
         return "entity_unavailable"
-    if is_heat(eid) != (cmd.action in HEAT_ACTIONS or cmd.action in AIR_ACTIONS or cmd.action == "restore"):
+    if cmd.action not in _actions(eid):
         return "invalid_command"  # nothing but a target or a mode is ever sent to a heat entity (a climate has its own turn_on/turn_off); HA-017: or a fan / vane value
-    if is_heat(eid):
+    if restorable(eid):
         if seen.heat is None:
             return "entity_unavailable"
         if cmd.action in AIR_ACTIONS:  # HA-017: only a value of the list the entity reports now
             return None if cmd.mode in seen.heat.get(AIR_ACTIONS[cmd.action][1], ()) else "mode_unsupported"
-        if cmd.action == "set_temperature" and not in_range(cmd.value, seen.heat):
-            return "out_of_range"
+        if cmd.action == "restore":
+            return None
+        if cmd.action in ("select_option", "set_preset_mode"):  # HA-021: only an option or preset the entity lists now (the text, never an index)
+            return None if cmd.mode in seen.heat.get("options" if cmd.action == "select_option" else "presetModes", ()) else "mode_unsupported"
+        if cmd.action == "set_value":  # HA-021: within the number's own min and max, on its step grid
+            return None if in_range(cmd.value, seen.heat, from_min=True) else "out_of_range"
+        if cmd.action == "set_temperature" and cmd.value_high is not None:  # HA-021 (D7): a range climate, both ends in range and low <= high
+            if "targetLow" not in seen.heat or not (in_range(cmd.value, seen.heat) and in_range(cmd.value_high, seen.heat)) or cmd.value > cmd.value_high:
+                return "out_of_range"
+        elif cmd.action == "set_temperature" and (not in_range(cmd.value, seen.heat) or seen.heat.get("target") is None and seen.heat.get("targetLow") is not None):
+            return "out_of_range"  # HA-021: a climate that shows a range takes a range, never a single target
         if cmd.mode is not None and cmd.mode not in seen.heat.get("modes", ()):
             return "mode_unsupported"
         if cmd.action == "set_temperature" and cmd.mode is None and _final_mode(cmd, seen) == "off":
@@ -806,9 +1035,11 @@ async def _lease_command(cmd: Command, until: float, env: Env) -> tuple[str, str
             env.leases.items[cmd.entity_id] = lease._replace(until=min(lease.until, env.wall()))
             await env.save()
             outcome = await _restore_locked(cmd.entity_id, env.leases.items[cmd.entity_id], env)
-            if outcome[0] == "done" or outcome[1] in ("outside_change", "not_controllable"):
+            if outcome[0] == "done" or outcome[1] in ("outside_change", "not_controllable", "restore_invalid"):
                 env.leases.cancel(cmd.entity_id)
                 await env.save()
+            if outcome[1] in ("outside_change", "restore_invalid"):  # HA-021 (§2g): done, but nothing was put back, and why
+                return "done", outcome[1], False
         elif env.leases is not None and env.leases.cancel(cmd.entity_id) is not None:
             await env.save()
         return "done", None, False
@@ -845,7 +1076,26 @@ def heat_verdict(lease: "Lease", seen: Seen | None) -> tuple[str, Command | None
             return "cancelled", None
     if not back:
         return "ended", None
-    return "restore", Command(lease.command, "", "restore", None, 0, None, back.get("temperature"), back.get("mode"))
+    if "low" in back or "high" in back:  # HA-021: a range goes back in one call with both ends
+        back["low"], back["high"] = lease.prev.get("low"), lease.prev.get("high")
+    return "restore", Command(lease.command, "", "restore", None, 0, None, back.get("temperature"), back.get("mode"), None, back)
+
+
+def _within(value: float, heat: dict) -> bool:
+    """HA-021 (§2g): within the entity's own min and max (both known), the only check HA itself makes for set_value and set_temperature: a value
+    HA showed (23 with step 5, 21.1 from °F) goes back even off the step grid."""
+    low, high = heat.get("min"), heat.get("max")
+    return low is not None and high is not None and low - 1e-9 <= value <= high + 1e-9
+
+
+def back_valid(back: dict, heat: dict) -> bool:
+    """HA-021 (§2g): whether the values a restore puts back still validate against the live state (option still listed, value in min..max, preset
+    listed, a range in min..max with low <= high); a restore that does not is never written (restore_invalid). HA-014's target and mode stay unchecked."""
+    low, high = back.get("low"), back.get("high")
+    return ((back.get("option") is None or back["option"] in heat.get("options", ()))
+            and (back.get("value") is None or _within(back["value"], heat))
+            and (back.get("preset") is None or back["preset"] in heat.get("presetModes", ()))
+            and (low is None and high is None or low is not None and high is not None and _within(low, heat) and _within(high, heat) and low <= high))
 
 
 async def _restore_locked(eid: str, lease: "Lease", env: Env) -> tuple[str, str | None, bool]:
@@ -860,6 +1110,8 @@ async def _restore_locked(eid: str, lease: "Lease", env: Env) -> tuple[str, str 
         return "failed", "outside_change", False
     if cmd is None:
         return "done", None, False
+    if not back_valid(cmd.back, seen.heat):
+        return "failed", "restore_invalid", False
     cmd = cmd._replace(entity_id=eid)
     calls = service_calls(cmd, seen)
     task = None
@@ -891,7 +1143,7 @@ class Lease(NamedTuple):
     command: str
     target: str  # on or level; HA-014: restore
     level: int | None
-    prev: dict | None = None  # restore: the values to put back, {"temperature", "mode"} (a key the lease does not change is None)
+    prev: dict | None = None  # restore: the values to put back, {"temperature", "mode"} (a key the lease does not change is None); HA-021: see _FIELDS
     set: dict | None = None  # restore: the values the lease set, the same shape; the entity must still show them
 
 
@@ -902,14 +1154,22 @@ def at_target(lease: Lease, seen: Seen | None) -> bool:
     return reached(Command(lease.command, "", lease.target, lease.level, 0), seen)
 
 
-def _spec(item: object) -> dict | None:
-    """A stored {"temperature", "mode"} of a restore lease, sanitised; None when it is not one."""
-    if not isinstance(item, dict) or item.keys() != {"temperature", "mode"}:
+_CHECKS = {"temperature": _heat_number, "low": _heat_number, "high": _heat_number, "mode": _heat_text, "preset": _heat_text, "option": _option_text, "value": _number}
+
+
+def _spec(item: object, eid: object) -> dict | None:
+    """A stored {"temperature", "mode"} of a restore lease, sanitised; None when it is not one. HA-021: a climate's may add preset, low and high; a
+    select's is {"option"}, a number's {"value"}."""
+    if not isinstance(item, dict) or not isinstance(eid, str):
         return None
-    temperature, mode = item["temperature"], item["mode"]
-    if temperature is not None and _heat_number(temperature) is None or mode is not None and _heat_text(mode) is None:
+    keys = set(item)
+    if not (keys == {"option" if eid.startswith("select.") else "value"} if is_setting(eid)
+            else is_heat(eid) and _HEAT_SPEC <= keys <= _HEAT_SPEC | ({"preset", "low", "high"} if eid.startswith("climate.") else set())):
         return None
-    return {"temperature": None if temperature is None else float(temperature), "mode": mode}
+    clean = {key: None if value is None else _CHECKS[key](value) for key, value in item.items()}
+    if any(clean[key] is None and item[key] is not None for key in keys):
+        return None
+    return clean
 
 
 class Leases:
@@ -919,14 +1179,14 @@ class Leases:
         self.items: dict[str, Lease] = {}
         for eid, item in (data or {}).items():
             try:
-                lease = Lease(float(item["until"]), str(item["command"]), item["target"], item.get("level"), _spec(item.get("prev")), _spec(item.get("set")))
+                lease = Lease(float(item["until"]), str(item["command"]), item["target"], item.get("level"), _spec(item.get("prev"), eid), _spec(item.get("set"), eid))
             except (KeyError, TypeError, ValueError, AttributeError):
                 continue  # a damaged entry is dropped, never guessed
             if not isinstance(eid, str):
                 continue
             if _ENTITY_ID.fullmatch(eid) and lease.target in ("on", "level"):
                 self.items[eid] = lease
-            elif (_HEAT_ENTITY.fullmatch(eid) and lease.target == "restore" and lease.prev is not None and lease.set is not None
+            elif (restorable(eid) and lease.target == "restore" and lease.prev is not None and lease.set is not None and lease.prev.keys() == lease.set.keys()
                   and any(want is not None for want in lease.set.values())):
                 self.items[eid] = lease
 
@@ -936,19 +1196,23 @@ class Leases:
     def grant_restore(self, eid: str, cmd: Command, seen: Seen, now: float) -> None:
         """HA-014: the lease of a leased set_temperature: it sets cmd's values (no temperature when the resulting mode is off) and keeps what
         the entity shows now as the values to put back. A lease already holding (the entity still shows what it set) keeps its own previous
-        values: a rule changing its mind must never record the already-raised values as the previous ones."""
+        values: a rule changing its mind must never record the already-raised values as the previous ones.
+        HA-021 (§2g): the same per key for a select's option, a number's value, a climate's preset and range (low, high); a climate's or water heater's
+        lease keeps {"temperature", "mode"} and adds the other keys only while it sets them (the 0.19.0 store shape for a heat-only lease)."""
         heat = seen.heat
-        temperature = cmd.value if cmd.value is not None and _final_mode(cmd, seen) != "off" else None
-        new_set = {"temperature": temperature, "mode": cmd.mode}
-        new_prev = {"temperature": heat.get("target") if temperature is not None else None, "mode": heat.get("mode") if cmd.mode is not None else None}
+        new_set = {**(dict.fromkeys(_HEAT_SPEC) if is_heat(eid) else {}), **_sets(cmd, seen)}
+        new_prev = {key: heat.get(_FIELDS[key]) if want is not None else None for key, want in new_set.items()}
+        if new_set.get("preset") is not None and new_prev.get("preset") is None and "none" in heat.get("presetModes", ()):
+            new_prev["preset"] = "none"  # HA-021 (§2g): no preset active is put back as the "none" preset (else the grant is refused, restore_invalid)
         old = self.items.get(eid)
         if old is not None and old.target == "restore" and heat_shows(old.set, seen):
             for key, held in old.set.items():
                 if held is not None:
-                    new_prev[key] = old.prev[key]
-                    if new_set[key] is None:
+                    new_prev[key] = old.prev.get(key)
+                    if new_set.get(key) is None:
                         new_set[key] = held
-        self.items[eid] = Lease(now + cmd.lease_s, cmd.id, "restore", None, new_prev, new_set)
+        keep = [key for key in new_set if key in _HEAT_SPEC or new_set[key] is not None]
+        self.items[eid] = Lease(now + cmd.lease_s, cmd.id, "restore", None, {k: new_prev.get(k) for k in keep}, {k: new_set[k] for k in keep})
 
     def renew(self, eid: str, command: str, seconds: int, seen: Seen | None, now: float) -> str | None:
         """None when extended; else the failure reason (no lease, it ended, or the entity left its target)."""

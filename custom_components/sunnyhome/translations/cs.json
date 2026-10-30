@@ -37,8 +37,9 @@
     "step": {
       "init": {
         "title": "Zařízení sdílená se SunnyHome",
-        "description": "Se SunnyHome se sdílejí jen zaškrtnuté spínače a světla: jejich název, stav a jas. Entity SolaX Modbus se nikdy nenabízejí.\n\n**Ovládání:** SunnyHome může zapínat, vypínat a stmívat zařízení zaškrtnutá v seznamu „Zařízení, která smí SunnyHome ovládat“, jakmile je ovládání tohoto připojení povoleno i v SunnyHome. Zaškrtnout tu lze i položky z Vytápění a teplé vody. Nikdy tam nezaškrtávejte spínač střídače, baterie ani nabíječky elektromobilu.\n\n**Senzory:** SunnyHome dostává hodnotu, jednotku a čas senzorů teploty, výkonu, energie, baterie, napětí, proudu, vlhkosti, plynu a vody zaškrtnutých v seznamu „Senzory, které smí SunnyHome číst“, pro svá automatizační pravidla a widget Zařízení.\n\n**Binární senzory a lidé:** SunnyHome dostává u dveřních, okenních, garážových, otvíracích, pohybových a přítomnostních senzorů zaškrtnutých v seznamu „Binární senzory, které smí SunnyHome vidět“ jen stav zapnuto nebo vypnuto a u lidí zaškrtnutých v seznamu „Lidé, které smí SunnyHome vidět“ jen doma nebo pryč. Nikdy nedostane zónu, název místa, souřadnice ani sledovací zařízení osoby. Jsou jen ke čtení a zobrazují se ve widgetu Zařízení; SunnyHome je nikdy neovládá.\n\n**Vytápění a teplá voda:** SunnyHome dostává jen režim, aktuální a cílovou teplotu, povolený rozsah teplot a dostupné režimy tepelných čerpadel, termostatů a ohřívačů vody zaškrtnutých v seznamu „Vytápění a teplá voda, které smí SunnyHome číst“ a u termostatu to, zda topí nebo chladí. Nic dalšího se neposílá. Zobrazují se ve widgetu Zařízení. SunnyHome nastavuje cílovou teplotu nebo režim jen u těch, která jsou zaškrtnutá i v seznamu „Zařízení, která smí SunnyHome ovládat“, a jen když je ovládání tohoto připojení povoleno v SunnyHome. U změny z automatizačního pravidla vrátí Home Assistant původní cílovou teplotu a režim, jakmile pravidlo přestane změnu obnovovat, ale jen pokud je mezitím nikdo ručně nezměnil. Termostat jen s dolní a horní cílovou teplotou se neovládá nikdy.",
+        "description": "**Celá zařízení:** zaškrtnutím zařízení Home Assistantu v seznamu „Celá zařízení“ ho sdílíte najednou celé, včetně entit, které přibudou později: jeho spínače a světla, dveřní, okenní a pohybové senzory, vytápění a klimatizaci, výběry a čísla (třeba režim ventilátoru klimatizace nebo jas displeje) a jeho číselné senzory (jakéhokoli druhu, třeba výkon, energie, vlhkost nebo signál). Vypnuté a skryté entity se nikdy neposílají, diagnostické jen pokud jsou to senzory. **Celé zařízení sdílí i své ovládání:** jakmile je ovládání tohoto připojení povoleno v SunnyHome, může SunnyHome zapínat a vypínat jeho spínače a světla, nastavovat vytápění a klimatizaci (cílovou, dolní a horní cílovou teplotu, režim, předvolbu), vybírat možnost výběru a nastavovat čísla, vždy jen v mezích, které zařízení samo dovoluje. Zařízení integrací střídačů, baterií a energie, zařízení použitá v panelu Energie a entity zvolené pro Jinou wallbox se takto nikdy nesdílejí a nenabízejí.\n\nSe SunnyHome se sdílejí jen zaškrtnuté spínače a světla: jejich název, stav a jas. Entity SolaX Modbus se nikdy nenabízejí.\n\n**Ovládání:** SunnyHome může zapínat, vypínat a stmívat zařízení zaškrtnutá v seznamu „Zařízení, která smí SunnyHome ovládat“, jakmile je ovládání tohoto připojení povoleno i v SunnyHome. Zaškrtnout tu lze i položky z Vytápění a teplé vody. Nikdy tam nezaškrtávejte spínač střídače, baterie ani nabíječky elektromobilu.\n\n**Senzory:** SunnyHome dostává hodnotu, jednotku a čas senzorů teploty, výkonu, energie, baterie, napětí, proudu, vlhkosti, plynu a vody zaškrtnutých v seznamu „Senzory, které smí SunnyHome číst“, pro svá automatizační pravidla a widget Zařízení.\n\n**Binární senzory a lidé:** SunnyHome dostává u dveřních, okenních, garážových, otvíracích, pohybových a přítomnostních senzorů zaškrtnutých v seznamu „Binární senzory, které smí SunnyHome vidět“ jen stav zapnuto nebo vypnuto a u lidí zaškrtnutých v seznamu „Lidé, které smí SunnyHome vidět“ jen doma nebo pryč. Nikdy nedostane zónu, název místa, souřadnice ani sledovací zařízení osoby. Jsou jen ke čtení a zobrazují se ve widgetu Zařízení; SunnyHome je nikdy neovládá.\n\n**Vytápění a teplá voda:** SunnyHome dostává jen režim, aktuální a cílovou teplotu, povolený rozsah teplot a dostupné režimy tepelných čerpadel, termostatů a ohřívačů vody zaškrtnutých v seznamu „Vytápění a teplá voda, které smí SunnyHome číst“ a u termostatu to, zda topí nebo chladí. Nic dalšího se neposílá. Zobrazují se ve widgetu Zařízení. SunnyHome nastavuje cílovou teplotu nebo režim jen u těch, která jsou zaškrtnutá i v seznamu „Zařízení, která smí SunnyHome ovládat“, a jen když je ovládání tohoto připojení povoleno v SunnyHome. U změny z automatizačního pravidla (cílová teplota, dolní a horní cílová teplota, režim, předvolba, možnost výběru nebo číslo) vrátí Home Assistant původní hodnotu, jakmile pravidlo přestane změnu obnovovat, ale jen pokud ji mezitím nikdo ručně nezměnil.",
         "data": {
+          "devices": "Celá zařízení",
           "entities": "Sdílená zařízení",
           "control": "Zařízení, která smí SunnyHome ovládat",
           "sensors": "Senzory, které smí SunnyHome číst",
@@ -47,6 +48,7 @@
           "heat": "Vytápění a teplá voda, které smí SunnyHome číst"
         },
         "data_description": {
+          "devices": "Sdílí se vše povolené z každého zařízení a smí se to ovládat, i entity přidané později. Spolu se seznamy níže nejvýše 512 entit a 512 senzorů. Prázdný seznam znamená, že se žádné celé zařízení nesdílí.",
           "control": "Každé musí být zaškrtnuté i ve Sdílených zařízeních nebo ve Vytápění a teplé vodě. Prázdný seznam znamená, že SunnyHome nic neovládá.",
           "sensors": "Nejvýše 32. Prázdný seznam znamená, že SunnyHome nečte žádné senzory.",
           "binary_sensors": "Dveřní, okenní, garážové, otvírací, pohybové a přítomnostní senzory: jen zapnuto nebo vypnuto. Spolu se sdílenými zařízeními, lidmi a vytápěním nejvýše 64. Prázdný seznam znamená, že SunnyHome žádné nevidí.",
@@ -95,13 +97,23 @@
       "too_many_sensors": "Vyberte nejvýše 32 senzorů.",
       "needs_both": "Vyberte senzor výkonu i číslo nabíjecího proudu, nebo obojí nechte prázdné.",
       "number_unit": "Číslo nabíjecího proudu musí být v ampérech (A).",
-      "number_range": "Číslo nabíjecího proudu potřebuje minimum a maximum, které připouští nějaký proud mezi 6 A a 32 A."
+      "number_range": "Číslo nabíjecího proudu potřebuje minimum a maximum, které připouští nějaký proud mezi 6 A a 32 A.",
+      "device_not_shareable": "Toto zařízení nelze sdílet celé: patří integraci střídače, baterie nebo energie, používá ho panel Energie, nebo už neexistuje.",
+      "too_many_device_entities": "Celá zařízení a seznamy níže mají dohromady víc než 512 entit nebo 512 senzorů."
     }
   },
   "issues": {
     "multiple_hubs": {
       "title": "Více integrací střídače zatím není podporováno",
       "description": "SunnyHome našlo více než jednu položku integrace střídače (SolaX Modbus, GoodWe nebo Deye), proto neodesílá žádná data ze střídače. Ponechte jen jednu a odesílání se obnoví."
+    },
+    "server_older": {
+      "title": "SunnyHome zatím nepřijímá celá zařízení",
+      "description": "Server SunnyHome je starší než tato integrace, proto se celá zařízení zaškrtnutá v nastavení neposílají; entity zaškrtnuté jednotlivě ano. Nic není třeba dělat: začnou se posílat, jakmile se SunnyHome aktualizuje."
+    },
+    "devices_trimmed": {
+      "title": "Některé entity celých zařízení se neposílají",
+      "description": "Celá zařízení zaškrtnutá v nastavení mají víc entit, než SunnyHome přijme (512 entit a 512 senzorů nebo velikost jednoho hlášení), proto se posílají jen první podle ID entity. Odškrtněte některé zařízení nebo jeho entity sdílejte jednotlivě."
     }
   }
 }
