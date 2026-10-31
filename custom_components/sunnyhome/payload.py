@@ -35,8 +35,9 @@ PROFILE_KEYS = frozenset({
     # main 1c6f72f); there battery_power_charge and battery_capacity are already the totals and battery_temperature does not exist
     "battery_1_voltage_charge", "battery_1_current_charge", "battery_1_power_charge", "battery_1_capacity_charge", "battery_1_temperature",
     "battery_2_voltage_charge", "battery_2_current_charge", "battery_2_power_charge", "battery_2_capacity_charge", "battery_2_temperature",
-    # HA-022 (0.21.0): the BMS readings (GEN4-6; plugin_solax.py at 2026.10.2) and the battery voltage and current (GEN2-4)
-    "cell_voltage_high", "cell_voltage_low", "battery_voltage_cell_difference", "battery_temp_high", "battery_temp_low",
+    # HA-022 (0.21.0): the BMS readings (GEN4-6; plugin_solax.py at 2026.10.2) and the battery voltage and current (GEN2-4); 0.21.1: not
+    # battery_voltage_cell_difference (an unrounded state), SunnyHome derives the difference from high and low
+    "cell_voltage_high", "cell_voltage_low", "battery_temp_high", "battery_temp_low",
     "battery_soh", "battery_voltage_charge", "battery_current_charge",
 })
 
@@ -44,7 +45,7 @@ PROFILE_KEYS = frozenset({
 # (0.21.0): the BMS readings).
 AUTO_ENABLE_KEYS = frozenset({
     "e_charge_today",
-    "cell_voltage_high", "cell_voltage_low", "battery_voltage_cell_difference", "battery_temp_high", "battery_temp_low", "battery_soh",
+    "cell_voltage_high", "cell_voltage_low", "battery_temp_high", "battery_temp_low", "battery_soh",
 })
 
 # SMB-004 (0.8.0): the Growatt, Solis and Sofar hybrids of solax_modbus's plugin_growatt.py, plugin_solis.py (and
