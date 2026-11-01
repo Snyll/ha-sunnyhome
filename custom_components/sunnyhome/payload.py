@@ -22,6 +22,9 @@ from urllib.parse import urlsplit
 PROFILE_KEYS = frozenset({
     "pv_power_1", "pv_power_2", "pv_power_3", "pv_power_total",
     "measured_power", "inverter_power",
+    # 0.22.0: meter 2 (a generator or second meter; input register 0xA8, plugin_solax.py at 2026.10.2), part of home consumption;
+    # disabled by default in solax_modbus, turned on below
+    "meter_2_measured_power",
     "inverter_power_l1", "inverter_power_l2", "inverter_power_l3",
     "eps_power_active_l1", "eps_power_active_l2", "eps_power_active_l3",
     "inverter_temperature", "run_mode",
@@ -42,9 +45,9 @@ PROFILE_KEYS = frozenset({
 })
 
 # SRC-009 (0.7.2): profile sensors solax_modbus ships disabled that SunnyHome turns on itself (exact home consumption; HA-022
-# (0.21.0): the BMS readings).
+# (0.21.0): the BMS readings; 0.22.0: meter 2).
 AUTO_ENABLE_KEYS = frozenset({
-    "e_charge_today",
+    "e_charge_today", "meter_2_measured_power",
     "cell_voltage_high", "cell_voltage_low", "battery_temp_high", "battery_temp_low", "battery_soh",
 })
 
