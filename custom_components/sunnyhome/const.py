@@ -1,7 +1,7 @@
 """Constants of the SunnyHome integration."""
 
 DOMAIN = "sunnyhome"
-VERSION = "0.22.0"  # manifest.json's version, sent on every claim (RA-004; HA-014: SunnyHome sends heat commands only to 0.16.0 or later; WALLBOX-005: set_current only to 0.17.0 or later; HA-017: fan / swing commands only for lists a 0.19.0+ component reported; HA-021: select, number, preset and range commands only to 0.20.0 or later; 0.20.1: energy in after_dependencies for hassfest; 0.20.2: a cancel answers not_controllable when nothing was put back; 0.21.0: HA-022 sends the SolaX BMS readings; 0.21.1: not the unrounded cell voltage difference; 0.22.0: meter 2 power, turned on like e_charge_today)
+VERSION = "0.23.0"  # manifest.json's version, sent on every claim (RA-004; HA-014: SunnyHome sends heat commands only to 0.16.0 or later; WALLBOX-005: set_current only to 0.17.0 or later; HA-017: fan / swing commands only for lists a 0.19.0+ component reported; HA-021: select, number, preset and range commands only to 0.20.0 or later; 0.20.1: energy in after_dependencies for hassfest; 0.20.2: a cancel answers not_controllable when nothing was put back; 0.21.0: HA-022 sends the SolaX BMS readings; 0.21.1: not the unrounded cell voltage difference; 0.22.0: meter 2 power, turned on like e_charge_today; 0.22.1: bounded inverter keepalive; 0.22.2: owner reset with physical proof; 0.23.0: inverter power up to 30000 W, SunnyHome sends above 1500 W only to 0.23.0 or later)
 DEFAULT_URL = "https://sunnyhome.cloud"
 CONF_LINK_ID = "link_id"
 CONF_ENTITIES = "entities"

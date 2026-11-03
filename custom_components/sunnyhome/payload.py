@@ -1275,6 +1275,7 @@ _INVERTER_KEYS = frozenset({"id", "inverter", "kind", "powerW", "durationS", "tt
 INVERTER_WATCH_S = 30  # the sensor must show the target this long after the mode select (solax_modbus scans slower than 10 s)
 INVERTER_CALL_S = 20  # a service call still running after this counts as failed (unknown once armed)
 INVERTER_SHOW_S = 5  # how long the timeout number may take to show the written value
+INVERTER_KEEPALIVE_S = 30  # minimum interval between attempts; also the maximum age of the actual mode report
 SETTLE_S = 60  # after the last dispatch the sensor's previous target, 0 or the target are ignored (it lags one scan)
 EXIT_RETRY_S = 60  # a lease exit not yet seen on the sensor is sent again at most this often
 EXIT_GIVE_UP_S = 86_400  # ... for at most a day after the lease end
@@ -1294,8 +1295,35 @@ class InverterCommand(NamedTuple):
     id: str
     op: str  # apply or exit
     kind: str | None  # charge, discharge, hold or no_discharge (apply only)
-    power_w: int | None  # 100-1500 for charge and discharge
+    power_w: int | None  # 100-30000 for charge and discharge
     duration_s: int | None  # 120-600 (apply): until - now when SunnyHome queued it
+    ttl_ms: int
+
+
+class PhysicalInverter(NamedTuple):
+    """Locally resolved physical identity, never a server-selected entity."""
+    serial: str
+    hub_id: str
+    device_id: str
+
+    def to_dict(self) -> dict:
+        return {"serial": self.serial, "hubId": self.hub_id, "deviceId": self.device_id}
+
+
+def physical_inverter(value: object) -> PhysicalInverter | None:
+    if not isinstance(value, dict) or value.keys() != {"serial", "hubId", "deviceId"}:
+        return None
+    parts = [value[key] for key in ("serial", "hubId", "deviceId")]
+    if any(not isinstance(part, str) or _key_part(part) != part for part in parts):
+        return None
+    return PhysicalInverter(*parts)
+
+
+class InverterReset(NamedTuple):
+    id: str
+    physical: PhysicalInverter
+    expected_mode: int
+    until: float
     ttl_ms: int
 
 
@@ -1310,20 +1338,46 @@ class InverterLease(NamedTuple):
     reason: str | None = None  # option_off: ended early because the option was turned off (reported with that reason)
 
 
-def parse_inverter(item: object) -> tuple[str | None, InverterCommand | None]:
+class InverterIntent(NamedTuple):
+    """Confirmed runtime-only parameters. Stored leases can authorize an exit, never a refresh."""
+
+    command: str
+    timeout: int
+    power: int | None
+
+
+def parse_inverter(item: object) -> tuple[str | None, InverterCommand | InverterReset | None]:
     """Strict check of one claimed inverter command (the agreed interface); the optional keys may be absent or null."""
     if not isinstance(item, dict) or not isinstance(cid := item.get("id"), str) or not _UUID.fullmatch(cid):
         return None, None
+    if item.get("inverter") == "reset":
+        return cid, _parse_reset(item, cid)
     op, kind, power, duration, ttl = (item.get(key) for key in ("inverter", "kind", "powerW", "durationS", "ttlMs"))
     valid = (
         item.keys() <= _INVERTER_KEYS and type(ttl) is int and ttl >= 0
         and (
             (op == "exit" and kind is None and power is None and duration is None)
             or (op == "apply" and type(kind) is str and kind in TARGETS and type(duration) is int and 120 <= duration <= 600
-                and (power is None if TARGETS[kind] != 4 else type(power) is int and 100 <= power <= 1500))
+                and (power is None if TARGETS[kind] != 4 else type(power) is int and 100 <= power <= 30000))
         )
     )
     return cid, (InverterCommand(cid, op, kind, power, duration, ttl) if valid else None)
+
+
+def _parse_reset(item: dict, cid: str) -> InverterReset | None:
+    if item.keys() != {"id", "inverter", "physical", "expectedMode", "until", "ttlMs"}:
+        return None
+    identity = physical_inverter(item["physical"])
+    mode, ttl, until = item["expectedMode"], item["ttlMs"], item["until"]
+    if identity is None or type(mode) is not int or mode not in (0, 6) or type(ttl) is not int or not 0 <= ttl <= 120_000:
+        return None
+    if not isinstance(until, str) or len(until) > 40 or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z", until):
+        return None
+    try:
+        stamp = datetime.fromisoformat(until).timestamp()
+    except (ValueError, OverflowError):
+        return None
+    return InverterReset(cid, identity, mode, stamp, ttl) if math.isfinite(stamp) else None
 
 
 def remote_mode(state: str | None) -> int | None:
@@ -1337,13 +1391,23 @@ def _key_part(value: object) -> str | None:
     return text if 0 < len(text) <= 64 and text.isascii() and text.isprintable() else None
 
 
-def remote_report(control: bool, state: str | None, reported: datetime | None, plugin: object, model: object, firmware: object) -> dict:
+def remote_recovery(physical: PhysicalInverter | None, reported: datetime | None) -> dict:
+    """Actual mode-sensor time, independent of the aggregated hub snapshot."""
+    return {"version": 1, "physical": physical.to_dict() if physical else None,
+            "modeObservedAt": _iso(reported) if reported else None}
+
+
+def remote_report(control: bool, state: str | None, reported: datetime | None, plugin: object, model: object, firmware: object,
+                  recovery: dict | None = None) -> dict:
     """The "remote" object of the /states solax object: control (the inverter option on with all four entities), the mode, the
     hub's snapshot time and the verified-key inputs (null without control)."""
-    return {
+    result = {
         "control": control, "mode": remote_mode(state), "lastReported": _iso(reported) if reported else None,
         "plugin": _key_part(plugin), "model": _key_part(model), "firmware": _key_part(firmware),
     }
+    if recovery is not None:
+        result["recovery"] = recovery
+    return result
 
 
 class Inverter:
@@ -1357,7 +1421,12 @@ class Inverter:
                  state: Callable[[str], str | None], dispatch: Callable[[str, str, dict], asyncio.Future],
                  save: Callable[[dict | None], Awaitable], report: Callable[[str, str, str | None], None],
                  clock: Callable[[], float] = time.monotonic, wall: Callable[[], float] = time.time,
-                 sleep: Callable[[float], Awaitable] = asyncio.sleep) -> None:
+                 sleep: Callable[[float], Awaitable] = asyncio.sleep,
+                 reported: Callable[[str], float | None] | None = None,
+                 identity: Callable[[], PhysicalInverter | None] | None = None,
+                 attribute: Callable[[str, str], object] | None = None) -> None:
+        self.identity = identity
+        self.attribute = attribute
         self.lock, self.remote, self.enabled, self.state, self.dispatch = lock, remote, enabled, state, dispatch
         self._save, self.report, self.clock, self.wall, self.sleep = save, report, clock, wall, sleep
         self.lease: InverterLease | None = None
@@ -1365,9 +1434,15 @@ class Inverter:
         self.exit_sent: float | None = None  # monotonic time of the last unconfirmed lease exit
         self.ticking = False
         self.unloaded = False  # set when the entry unloads: a tick still waiting for the hub lock then writes nothing
+        self.reported = reported
+        self.intent: InverterIntent | None = None
+        self.authority_until: float | None = None  # original claim time + duration, on the monotonic clock
+        self.refresh_sent: float | None = None
 
     def load(self, data: object) -> None:
         """The stored lease; one that ended while HA was down is ended by the next tick and reported as a restart."""
+        self.intent, self.authority_until, self.refresh_sent = None, None, None
+        self.lease, self.exit_sent, self.restarted = None, None, False
         try:
             lease = InverterLease(str(data["command"]), float(data["until"]), int(data["target"]),
                                   None if data.get("prev") is None else int(data["prev"]), float(data["settle"]),
@@ -1382,6 +1457,7 @@ class Inverter:
 
     async def _drop(self, outcome: str | None, reason: str | None) -> None:
         lease, self.lease, self.exit_sent, self.restarted = self.lease, None, None, False
+        self.intent, self.authority_until, self.refresh_sent = None, None, None
         await self.save()
         if outcome:
             self.report(lease.command, outcome, reason)
@@ -1390,13 +1466,22 @@ class Inverter:
         """Run one claimed command; (outcome, reason). The hub lock is the first await, so commands keep claim order."""
         until = deadline(sent, cmd.ttl_ms)
         async with self.lock:
+            if self.unloaded:
+                return "failed", "inverter_control_off"
+            remote = self.remote()
+            if remote and self.lease and self._parameters(remote) is False:
+                await self._drop("lease_cancelled", "outside_change")
+                return "failed", "external_control"
+            if cmd.op == "apply":
+                # Even a refused replacement must not leave its predecessor eligible for replay.
+                self.intent, self.refresh_sent = None, None
             if cmd.op == "exit" and self.lease is not None and self.lease.until > self.wall():
                 # An exit ends the lease whatever happens next: the tick then sends Disabled until the sensor shows it.
                 self.lease = self.lease._replace(until=self.wall())
                 await self.save()
             if cmd.op == "apply" and not self.enabled():
                 return "failed", "inverter_control_off"
-            if (remote := self.remote()) is None:
+            if remote is None:
                 return "failed", "entities_missing"
             # BAT-008B F1: the power and timeout numbers are solax_modbus local values, "unknown" until their first write (which
             # the apply makes), so only a missing or unavailable one refuses.
@@ -1413,16 +1498,105 @@ class Inverter:
                 return await self._exit(remote) if self.lease else ("done", None)
             return await self._apply(cmd, sent, remote)
 
+    def _reset_state(self, cmd: InverterReset, remote: Remote) -> tuple[int | None, str | None]:
+        if self.unloaded or not self.enabled():
+            return None, "inverter_control_off"
+        if self.remote() != remote or self.identity is None or self.identity() != cmd.physical:
+            return None, "physical_device_changed"
+        stamp = self.reported(remote.sensor) if self.reported else None
+        now = self.wall()
+        if stamp is None or not math.isfinite(stamp) or stamp > now or now - stamp > INVERTER_KEEPALIVE_S:
+            return None, "state_stale"
+        mode = remote_mode(self.state(remote.sensor))
+        if mode is None:
+            return None, "state_unavailable"
+        if mode not in (0, 6) or cmd.expected_mode == 0 and mode != 0:
+            return None, "mode_changed"
+        return mode, None
+
+    async def reset(self, cmd: InverterReset, sent: float) -> tuple[str, str | None, dict | None]:
+        """Explicit owner recovery: one selection, no lease/retry, command-specific physical proof."""
+        start_until = deadline(sent, cmd.ttl_ms)
+        end = min(sent + 120, self.clock() + max(0, cmd.until - self.wall()))
+        async with self.lock:
+            remote = self.remote()
+            if remote is None:
+                return "failed", "entities_missing", None
+            if self.clock() >= start_until or self.clock() >= end or self.wall() >= cmd.until:
+                return "failed", "expired_on_arrival", None
+            _, reason = self._reset_state(cmd, remote)
+            if reason:
+                return "failed", reason, None
+            await self._drop(None, None)
+            # Saving may await. Repeat identity, mode and deadline checks immediately before selection.
+            if self.clock() >= start_until or self.clock() >= end or self.wall() >= cmd.until:
+                return "failed", "expired_on_arrival", None
+            mode, reason = self._reset_state(cmd, remote)
+            if reason:
+                return "failed", reason, None
+            barrier = self.wall()
+            if mode == 6 and not await self._reset_call(remote, end, cmd.until):
+                return "unknown", "service_error", None
+            watch_end = min(end, self.clock() + INVERTER_WATCH_S)
+            while True:
+                if self.clock() >= end or self.wall() >= cmd.until:
+                    return "unknown", "reset_timeout", None
+                mode, reason = self._reset_state(cmd, remote)
+                if reason:
+                    return "unknown", reason, None
+                stamp = self.reported(remote.sensor)
+                if mode == 0 and stamp > barrier:
+                    return "done", None, {"mode": 0, "modeObservedAt": _iso(datetime.fromtimestamp(stamp, UTC)),
+                                          "physical": cmd.physical.to_dict()}
+                if self.clock() >= watch_end:
+                    return "unknown", "no_confirmation", None
+                await self.sleep(POLL_S)
+
+    async def _reset_call(self, remote: Remote, end: float, wall_end: float) -> bool:
+        """Drain service work on timeout/unload/cancellation while retaining the hub lock."""
+        try:
+            task = self.dispatch("select", "select_option", {"entity_id": remote.mode, "option": SELECT_DISABLED})
+        except Exception as err:  # noqa: BLE001 - an attempted selection is never retried
+            _LOGGER.debug("Inverter reset refused: %s", type(err).__name__)
+            return False
+        cancelled, completed = False, False
+        try:
+            call_end = min(end, self.clock() + INVERTER_CALL_S)
+            while not task.done():
+                if self.unloaded or not self.enabled() or self.clock() >= call_end or self.wall() >= wall_end:
+                    break
+                await self.sleep(POLL_S)
+            completed = task.done() and not task.cancelled() and task.exception() is None
+        except asyncio.CancelledError:
+            cancelled = True
+        finally:
+            if not task.done():
+                task.cancel()
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled = cancelled or bool(asyncio.current_task().cancelling())
+                except Exception:  # noqa: BLE001 - drain the failed child
+                    pass
+            if not task.cancelled():
+                task.exception()
+            if cancelled:
+                raise asyncio.CancelledError
+        return completed
+
     async def _apply(self, cmd: InverterCommand, sent: float, remote: Remote) -> tuple[str, str | None]:
         elapsed, now = self.clock() - sent, self.wall()
         target = TARGETS[cmd.kind]
         self.lease = InverterLease(cmd.id, now - elapsed + cmd.duration_s, target, self.lease and self.lease.target, now + SETTLE_S)
+        self.authority_until = sent + cmd.duration_s
         self.exit_sent, self.restarted = None, False
         await self.save()  # armed before the first call: a crash right after it never leaves a mode without its lease
         timeout = math.ceil((cmd.duration_s - elapsed) / 60) * 60 + 60  # the inverter's own backstop; the entity steps by 60
+        power = None
         calls = [("number", "set_value", {"entity_id": remote.timeout, "value": timeout})]
         if target == 4:  # SolaX mode 4: positive = discharge
-            power = cmd.power_w if cmd.kind == "discharge" else -cmd.power_w
+            power = self._within_entity(remote, cmd.power_w if cmd.kind == "discharge" else -cmd.power_w)
             calls.append(("number", "set_value", {"entity_id": remote.power, "value": power}))
         for call in calls:
             if not await self._call(*call):
@@ -1431,7 +1605,87 @@ class Inverter:
             return "unknown", "timeout_not_set"
         if not await self._call("select", "select_option", {"entity_id": remote.mode, "option": _SELECTS[target]}):
             return "unknown", "service_error"
-        return await self._watch(remote.sensor, target)
+        result = await self._watch(remote.sensor, target)
+        if result[0] == "done":
+            self.intent = InverterIntent(cmd.id, timeout, power)
+            self.refresh_sent = self.clock()
+        return result
+
+    def _within_entity(self, remote: Remote, power: int) -> int:
+        """BAT-021: the power cut to the number's own limit (a charge is negative, so its min), so a saved power above the inverter's still charges; the intent keeps
+        what was written and SunnyHome sees the slower flow as applied_limited. A limit that is unreadable or on the wrong side of zero changes nothing."""
+        bound = self.attribute(remote.power, "min" if power < 0 else "max") if self.attribute else None
+        if isinstance(bound, bool) or not isinstance(bound, (int, float)) or not abs(bound) < abs(power) or bound * power <= 0:  # NaN and infinity fail the size test
+            return power
+        return int(bound)
+
+    def _parameters(self, remote: Remote) -> bool | None:
+        """True for matching pinned parameters, False for known drift, None when any relevant value is unknown."""
+        if self.intent is None:
+            return None
+        expected = [(remote.timeout, self.intent.timeout)]
+        if self.intent.power is not None:
+            expected.append((remote.power, self.intent.power))
+        known = True
+        for entity, value in expected:
+            try:
+                actual = float(self.state(entity))
+            except (TypeError, ValueError):
+                known = False
+                continue
+            if not math.isfinite(actual):
+                known = False
+            elif actual != value:
+                return False
+        return True if known else None
+
+    async def _keepalive(self, remote: Remote, mode: int | None) -> None:
+        """Resend only a fresh, exactly owned mode, without extending the lease or its settle grace."""
+        if self.intent is None or self.intent.command != self.lease.command or self.lease.reason is not None \
+                or mode != self.lease.target or self.authority_until is None or self.reported is None:
+            return
+        now = self.clock()
+        if self.refresh_sent is None or now < self.refresh_sent + INVERTER_KEEPALIVE_S \
+                or min(self.lease.until - self.wall(), self.authority_until - now) < INVERTER_CALL_S \
+                or self._parameters(remote) is not True:
+            return
+        reported = self.reported(remote.sensor)
+        if reported is None or not 0 <= self.wall() - reported <= INVERTER_KEEPALIVE_S:
+            return
+        self.refresh_sent = now  # failures are throttled too; no catch-up after skipped ticks
+        await self._refresh_call(remote)
+
+    async def _refresh_call(self, remote: Remote) -> None:
+        """Keep the hub lock until the service task is finished, including cancellation-resistant services."""
+        try:
+            task = self.dispatch("select", "select_option", {"entity_id": remote.mode, "option": _SELECTS[self.lease.target]})
+        except Exception as err:  # noqa: BLE001 - the next eligible tick may retry
+            _LOGGER.debug("Inverter keepalive refused: %s", type(err).__name__)
+            return
+        cancelled = False
+        try:
+            end = self.clock() + INVERTER_CALL_S
+            while not task.done():
+                if self.unloaded or not self.enabled() or self.clock() >= end:
+                    break
+                await self.sleep(POLL_S)
+        except asyncio.CancelledError:
+            cancelled = True
+        finally:
+            if not task.done():
+                task.cancel()
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    # A cancelled child is drained; cancellation of this tick must propagate after draining.
+                    cancelled = cancelled or bool(asyncio.current_task().cancelling())
+                except Exception:  # noqa: BLE001 - consume a service failure, then allow the next throttled attempt
+                    pass
+            if not task.cancelled():
+                task.exception()
+            if cancelled:
+                raise asyncio.CancelledError
 
     async def _exit(self, remote: Remote) -> tuple[str, str | None]:
         if not await self._call("select", "select_option", {"entity_id": remote.mode, "option": SELECT_DISABLED}):
@@ -1442,20 +1696,42 @@ class Inverter:
         return result
 
     async def _call(self, domain: str, service: str, data: dict) -> bool:
-        """One service call, awaited; False when it was refused (also synchronously), failed or ran too long."""
+        """Keep all local inverter service work under the hub lock, including after timeout/cancellation."""
+        disabled_exit = domain == "select" and service == "select_option" and data.get("option") == SELECT_DISABLED
+        if self.unloaded or not self.enabled() and not disabled_exit:
+            return False
         try:
             task = self.dispatch(domain, service, data)
-        except Exception as err:  # noqa: BLE001 - armed: any refusal ends the sequence as unknown
+        except Exception as err:  # noqa: BLE001 - armed: a refusal has an unknown physical outcome
             _LOGGER.debug("Inverter call refused: %s", type(err).__name__)
             return False
         if self.lease is not None:
             self.lease = self.lease._replace(settle=self.wall() + SETTLE_S)
-        end = self.clock() + INVERTER_CALL_S
-        while not task.done():
-            if self.clock() >= end:
-                return False
-            await self.sleep(POLL_S)
-        return not task.cancelled() and task.exception() is None
+        cancelled, completed = False, False
+        try:
+            end = self.clock() + INVERTER_CALL_S
+            while not task.done():
+                if self.unloaded or not self.enabled() and not disabled_exit or self.clock() >= end:
+                    break
+                await self.sleep(POLL_S)
+            completed = task.done() and not task.cancelled() and task.exception() is None
+        except asyncio.CancelledError:
+            cancelled = True
+        finally:
+            if not task.done():
+                task.cancel()
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled = cancelled or bool(asyncio.current_task().cancelling())
+                except Exception:  # noqa: BLE001 - drain the child before another local writer
+                    pass
+            if not task.cancelled():
+                task.exception()
+            if cancelled:
+                raise asyncio.CancelledError
+        return completed
 
     async def _shows(self, entity_id: str, value: float) -> bool:
         end = self.clock() + INVERTER_SHOW_S
@@ -1497,17 +1773,22 @@ class Inverter:
                 return
             remote = self.remote()
             mode = remote_mode(self.state(remote.sensor)) if remote else None
+            if remote and self._parameters(remote) is False:
+                await self._drop("lease_cancelled", "outside_change")
+                return
             if not self.enabled() and lease.reason != "option_off":
                 # The option is off (setup after saving it): the lease ends now, so the exit below is sent until Disabled shows.
                 lease = self.lease = lease._replace(until=min(lease.until, now), reason="option_off")
                 await self.save()
             if mode not in (None, 0, lease.target, lease.prev):  # another mode: someone else took over; left as it is
                 await self._drop("lease_cancelled", "outside_change")
-            elif lease.until > now:
+            elif lease.until > now and (self.authority_until is None or self.clock() < self.authority_until):
                 # ponytail: the 5 s tick reads the sensor (no state listener); a flip shorter than a tick goes unseen.
                 # The previous target is still ours (e.g. a re-apply whose mode select failed); another mode cancelled above.
                 if now >= lease.settle and mode == 0:
                     await self._drop("lease_ended", "inverter")
+                elif remote and self.enabled():
+                    await self._keepalive(remote, mode)
             elif mode == 0:
                 await self._drop("lease_ended", lease.reason or ("restart" if self.restarted else "expired"))
             elif now > lease.until + EXIT_GIVE_UP_S:

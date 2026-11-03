@@ -416,6 +416,18 @@ def solax_remote(hass: HomeAssistant) -> payload.Remote | None:
     return payload.Remote(**found, device_id=device) if len(found) == len(REMOTE_KEYS) else None
 
 
+def solax_physical(hass: HomeAssistant) -> payload.PhysicalInverter | None:
+    """Identity of the mode sensor's current hub and parent inverter device."""
+    remote = solax_remote(hass)
+    if remote is None:
+        return None
+    entity = er.async_get(hass).async_get(remote.sensor)
+    device = main_device(hass, remote.device_id)
+    if entity is None or device is None:
+        return None
+    return payload.physical_inverter({"serial": device.serial_number, "hubId": entity.config_entry_id, "deviceId": device.id})
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await watch_energy(hass)  # HA-021 (D6): before the first push, never in collect()
     pusher = Pusher(hass, entry)
@@ -699,7 +711,8 @@ class Pusher:
         times = [reading[3] for reading in readings or () if reading[3]] + ([state.last_reported] if state and state.last_reported else [])
         control = bool(self.entry.options.get(CONF_INVERTER)) and len(found) == len(REMOTE_KEYS)
         if not control:
-            return payload.remote_report(False, state.state if state else None, max(times, default=None), None, None, None)
+            return payload.remote_report(False, state.state if state else None, max(times, default=None), None, None, None,
+                                         payload.remote_recovery(None, state.last_reported if state else None))
         device = main_device(self.hass, device_id)
         try:
             plugin = loader.async_get_loaded_integration(self.hass, SOLAX).version
@@ -708,6 +721,7 @@ class Pusher:
         return payload.remote_report(
             True, state.state if state else None, max(times, default=None), plugin,
             device.model if device else None, device.sw_version if device else None,
+            payload.remote_recovery(solax_physical(self.hass), state.last_reported if state else None),
         )
 
     def device_of(self, ent: er.RegistryEntry, v2: bool = False) -> tuple[str | None, str | None, str | None, str | None]:
@@ -989,6 +1003,7 @@ class CommandRunner:
             shared["locks"].setdefault(SOLAX, asyncio.Lock()), lambda: solax_remote(hass),
             lambda: bool(entry.options.get(CONF_INVERTER)), self.raw_state, self.dispatch, self.save_inverter,
             lambda command, outcome, reason: self.report(command, outcome, reason, None),
+            reported=self.last_reported, identity=lambda: solax_physical(hass), attribute=self.raw_attribute,
         )
         # EV-004: the wallbox lease has its own store and lock; the echoes (the select's last_reported of SunnyHome's own write) are shared
         # with the pusher, which withholds the work mode until a real poll.
@@ -1063,6 +1078,14 @@ class CommandRunner:
 
     def raw_state(self, entity_id: str) -> str | None:
         return state.state if (state := self.hass.states.get(entity_id)) is not None else None
+
+    def raw_attribute(self, entity_id: str, name: str) -> object:
+        return state.attributes.get(name) if (state := self.hass.states.get(entity_id)) is not None else None
+
+    def last_reported(self, entity_id: str) -> float | None:
+        """The sensor's own HA report time; reading a cached state never refreshes its age."""
+        state = self.hass.states.get(entity_id)
+        return state.last_reported.timestamp() if state is not None and state.last_reported is not None else None
 
     async def save(self) -> None:
         await self.store.async_save(self.leases.to_dict())
@@ -1223,7 +1246,8 @@ class CommandRunner:
                     generic = isinstance(item, dict) and item.get("wallbox") == "set_current"  # WALLBOX-005
                     wallbox = isinstance(item, dict) and "wallbox" in item and not generic  # EV-004
                     parse = payload.parse_generic if generic else payload.parse_wallbox if wallbox else payload.parse_inverter if inverter else payload.parse_command
-                    run = self.execute_generic if generic else self.execute_wallbox if wallbox else self.execute_inverter if inverter else self.execute
+                    run = self.execute_generic if generic else self.execute_wallbox if wallbox else self.execute_reset \
+                        if inverter and item.get("inverter") == "reset" else self.execute_inverter if inverter else self.execute
                     cid, cmd = parse(item)
                     if cid is not None:  # an invalid command without a valid id is dropped
                         self.entry.async_create_background_task(self.hass, run(cid, cmd, sent), "SunnyHome command")
@@ -1252,6 +1276,13 @@ class CommandRunner:
         """BAT-008: one inverter command; its result carries assumedState null."""
         outcome, reason = ("failed", "invalid_command") if cmd is None else await self.inverter.execute(cmd, sent)
         await self.result({"commandId": cid, "outcome": outcome, "reason": reason, "assumedState": None}, time.monotonic())
+
+    async def execute_reset(self, cid: str, cmd: payload.InverterReset | None, sent: float) -> None:
+        """Proof is attached only to the explicit reset result."""
+        outcome, reason, proof = ("failed", "invalid_command", None) if not isinstance(cmd, payload.InverterReset) \
+            else await self.inverter.reset(cmd, sent)
+        await self.result({"commandId": cid, "outcome": outcome, "reason": reason, "assumedState": None,
+                           "resetProof": proof}, time.monotonic())
 
     async def execute_wallbox(self, cid: str, cmd: payload.WallboxCommand | None, sent: float) -> None:
         """EV-004: one wallbox command; its result carries assumedState null. P3-2: no lease reports for wallbox rows."""
