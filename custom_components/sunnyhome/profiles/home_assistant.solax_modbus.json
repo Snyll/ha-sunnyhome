@@ -2,6 +2,11 @@
   "contract": "inverter-settings-v1",
   "profile": "home_assistant.solax_modbus",
   "source": "home_assistant",
+  "exportLimitControl": {
+    "entity": "number.export_control_user_limit",
+    "unlock": { "entity": "select.lock_state", "option": "Unlocked" },
+    "asleep": { "entity": "sensor.run_mode", "states": ["Idle Mode"] }
+  },
   "vendor": "solax",
   "note": "Home Assistant solax_modbus hub shared with the SunnyHome component. entity: <domain>.<key after the hub prefix>; values: HA option string -> catalog code.",
   "staleSeconds": 300,

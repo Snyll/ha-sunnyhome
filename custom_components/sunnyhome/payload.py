@@ -232,6 +232,12 @@ SETTINGS_ENTITIES = {
         e for m in json.loads(path.read_text("utf-8"))["settings"].values() for e in _entities(m))
     for path in sorted((Path(__file__).parent / "profiles").glob("home_assistant.*.json"))
 }
+# INVF-006: a profile's export limit write, by "<domain>.<unique id key>"; no entry: this brand's limit is read only until an entry and a passed check exist.
+LIMIT_CONTROLS = {
+    path.name[len("home_assistant."):-len(".json")]: control
+    for path in sorted((Path(__file__).parent / "profiles").glob("home_assistant.*.json"))
+    if (control := json.loads(path.read_text("utf-8")).get("exportLimitControl"))
+}
 _CODE = re.compile(r"[0-9A-HJKMNP-TV-Z]{8}")
 
 
@@ -1291,10 +1297,20 @@ class Remote(NamedTuple):
     device_id: str | None = None  # the inverter device (model, sw_version)
 
 
+class LimitEntities(NamedTuple):
+    """INVF-006: what the hub's profile names for the export limit, resolved locally; SunnyHome sends watts only."""
+
+    limit: str  # the number
+    unlock: str | None  # the select that must allow the write, if any
+    unlock_option: str | None
+    run_mode: str  # the sensor the inverter's sleep shows on
+    asleep: frozenset[str]  # its states that ignore writes
+
+
 class InverterCommand(NamedTuple):
     id: str
-    op: str  # apply or exit
-    kind: str | None  # charge, discharge, hold or no_discharge (apply only)
+    op: str  # apply, exit or limit
+    kind: str | None  # charge, discharge, hold or no_discharge (apply); lower or restore (limit)
     power_w: int | None  # 100-30000 for charge and discharge
     duration_s: int | None  # 120-600 (apply): until - now when SunnyHome queued it
     ttl_ms: int
@@ -1357,6 +1373,7 @@ def parse_inverter(item: object) -> tuple[str | None, InverterCommand | Inverter
         item.keys() <= _INVERTER_KEYS and type(ttl) is int and ttl >= 0
         and (
             (op == "exit" and kind is None and power is None and duration is None)
+            or (op == "limit" and kind in ("lower", "restore") and type(power) is int and 0 <= power <= 30000 and duration is None)
             or (op == "apply" and type(kind) is str and kind in TARGETS and type(duration) is int and 120 <= duration <= 600
                 and (power is None if TARGETS[kind] != 4 else type(power) is int and 100 <= power <= 30000))
         )
@@ -1424,7 +1441,9 @@ class Inverter:
                  sleep: Callable[[float], Awaitable] = asyncio.sleep,
                  reported: Callable[[str], float | None] | None = None,
                  identity: Callable[[], PhysicalInverter | None] | None = None,
-                 attribute: Callable[[str, str], object] | None = None) -> None:
+                 attribute: Callable[[str, str], object] | None = None,
+                 limit_entities: Callable[[], LimitEntities | None] | None = None) -> None:
+        self.limit_entities = limit_entities
         self.identity = identity
         self.attribute = attribute
         self.lock, self.remote, self.enabled, self.state, self.dispatch = lock, remote, enabled, state, dispatch
@@ -1468,6 +1487,8 @@ class Inverter:
         async with self.lock:
             if self.unloaded:
                 return "failed", "inverter_control_off"
+            if cmd.op == "limit":  # INVF-006: another register: a running mode's lease and mode sensor do not concern it
+                return await self._limit(cmd, until)
             remote = self.remote()
             if remote and self.lease and self._parameters(remote) is False:
                 await self._drop("lease_cancelled", "outside_change")
@@ -1497,6 +1518,46 @@ class Inverter:
             if cmd.op == "exit":
                 return await self._exit(remote) if self.lease else ("done", None)
             return await self._apply(cmd, sent, remote)
+
+    async def _limit(self, cmd: InverterCommand, until: float) -> tuple[str, str | None]:
+        """INVF-006: the export limit through the mapped entities only. "failed" when nothing was written (asleep is the awake detection: Idle ignores writes,
+        and an unknown run mode counts as asleep); after the first write every failure is "unknown"; "done" is no proof: SunnyHome reads the setting back."""
+        if cmd.kind == "lower" and not self.enabled():
+            return "failed", "inverter_control_off"
+        found = self.limit_entities() if self.limit_entities else None
+        if found is None:
+            return "failed", "entities_missing"
+        if self.clock() >= until:
+            return "failed", "expired_on_arrival"
+        run_mode = self.state(found.run_mode)
+        if run_mode is None or run_mode in ("unavailable", "unknown") or run_mode in found.asleep:
+            return "failed", "inverter_asleep"
+        if self.state(found.limit) in (None, "unavailable", "unknown"):
+            return "failed", "entity_unavailable"
+        for bound, outside in (("min", lambda b: cmd.power_w < b), ("max", lambda b: cmd.power_w > b)):
+            value = self.attribute(found.limit, bound) if self.attribute else None
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and outside(value):
+                return "failed", "out_of_range"
+        if found.unlock is not None and not await self._limit_call("select", "select_option", {"entity_id": found.unlock, "option": found.unlock_option}):
+            return "failed", "unlock_failed"  # the limit was not written
+        if not await self._limit_call("number", "set_value", {"entity_id": found.limit, "value": cmd.power_w}):
+            return "unknown", "service_error"
+        return "done", None
+
+    async def _limit_call(self, domain: str, service: str, data: dict) -> bool:
+        """One awaited call under the hub lock; False when it was refused, failed or ran too long."""
+        try:
+            task = self.dispatch(domain, service, data)
+        except Exception as err:  # noqa: BLE001 - a refusal at dispatch
+            _LOGGER.debug("Limit call refused: %s", type(err).__name__)
+            return False
+        end = self.clock() + INVERTER_CALL_S
+        while not task.done():
+            if self.unloaded or self.clock() >= end:
+                task.cancel()
+                return False
+            await self.sleep(POLL_S)
+        return not task.cancelled() and task.exception() is None
 
     def _reset_state(self, cmd: InverterReset, remote: Remote) -> tuple[int | None, str | None]:
         if self.unloaded or not self.enabled():

@@ -410,6 +410,26 @@ def solax_entities(hass: HomeAssistant) -> tuple[dict[str, str], str | None]:
     return found, device
 
 
+def solax_limit(hass: HomeAssistant) -> payload.LimitEntities | None:
+    """INVF-006: the entities the SolaX profile maps for the export limit on the single solax_modbus hub; None unless all are there. Never another hub's."""
+    control = payload.LIMIT_CONTROLS.get(SOLAX)
+    hubs = [entry for entry in hass.config_entries.async_entries(SOLAX) if not payload.ev_plugin(hub_plugin(entry))]
+    if control is None or len(hubs) != 1 or hass.config_entries.async_entries(GOODWE) or deye_entries(hass) or not payload.solax_plugin(hub_plugin(hubs[0])):
+        return None
+    prefix = f"{hubs[0].options.get('name') or hubs[0].data.get('name')}_"
+    unlock = control.get("unlock")
+    named = {control["entity"], control["asleep"]["entity"]} | ({unlock["entity"]} if unlock else set())
+    found = {}
+    for ent in er.async_entries_for_config_entry(er.async_get(hass), hubs[0].entry_id):
+        key = f"{ent.domain}.{ent.unique_id[len(prefix):]}" if ent.unique_id.startswith(prefix) else None
+        if ent.platform == SOLAX and not ent.disabled and key in named:
+            found[key] = ent.entity_id
+    if len(found) != len(named):
+        return None
+    return payload.LimitEntities(found[control["entity"]], found[unlock["entity"]] if unlock else None, unlock["option"] if unlock else None,
+                                 found[control["asleep"]["entity"]], frozenset(control["asleep"]["states"]))
+
+
 def solax_remote(hass: HomeAssistant) -> payload.Remote | None:
     """BAT-008: the four direct VPP entities of the single solax_modbus hub; None unless all are there."""
     found, device = solax_entities(hass)
@@ -1003,7 +1023,7 @@ class CommandRunner:
             shared["locks"].setdefault(SOLAX, asyncio.Lock()), lambda: solax_remote(hass),
             lambda: bool(entry.options.get(CONF_INVERTER)), self.raw_state, self.dispatch, self.save_inverter,
             lambda command, outcome, reason: self.report(command, outcome, reason, None),
-            reported=self.last_reported, identity=lambda: solax_physical(hass), attribute=self.raw_attribute,
+            reported=self.last_reported, identity=lambda: solax_physical(hass), attribute=self.raw_attribute, limit_entities=lambda: solax_limit(hass),
         )
         # EV-004: the wallbox lease has its own store and lock; the echoes (the select's last_reported of SunnyHome's own write) are shared
         # with the pusher, which withholds the work mode until a real poll.
