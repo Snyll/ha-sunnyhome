@@ -773,8 +773,10 @@ class Pusher:
             attrs = {k: v for k, v in state.attributes.items() if k not in dropped} if dropped else state.attributes
             return payload.Entity(eid, state.name, state.state, None, False, state.last_reported, None, attrs, self.hass.config.units.temperature_unit,
                                   *device, category)
-        # HA-021: a select or number (whole devices only)
-        return payload.Entity(eid, state.name, state.state, None, False, state.last_changed, None, state.attributes,
+        # HA-021: a select or number (whole devices only); DIV-009: no reading while a number still shows SunnyHome's own write of 0 (no real poll since)
+        echo = self.hass.data.setdefault(DOMAIN, {}).setdefault("zero_echoes", {}).get(eid) if domain == "number" else None
+        withheld = echo is not None and payload.zero_withheld(echo, state.last_reported.timestamp() if state.last_reported else None, time.time())
+        return payload.Entity(eid, state.name, "unknown" if withheld else state.state, None, False, state.last_changed, None, state.attributes,
                               state.attributes.get("unit_of_measurement"), *device, category)
 
     def entities(self, v2: bool = False, devices: list | None = None, cap: int = payload.MAX_ENTITIES) -> list[payload.Entity]:
@@ -1042,6 +1044,7 @@ class CommandRunner:
             shared["locks"], shared.setdefault("inflight", {}),
             lambda entity_id: entity_id in controllable(hass, entry), self.seen, self.dispatch,
             leases=self.leases, save=self.save, dispatch_many=self.dispatch_many,
+            zero_echoes=shared.setdefault("zero_echoes", {}), reported=self.last_reported,  # DIV-009: separate from the wallboxes' echoes: its entries carry a bound
         )
 
     async def start_leases(self) -> None:
@@ -1126,8 +1129,11 @@ class CommandRunner:
                 # HA-021 (§2g): counted from the later of the lease end and the first check that saw it due, so a lease that ended during a long HA outage
                 # still gets its restore (or off), reported as restart
                 start = max(lease.until, self.checked.setdefault(eid, now))
-                if now > start + (payload.HEAT_RESTORE_GIVE_UP_S if lease.target == "restore" else LEASE_GIVE_UP_S):  # ponytail: a device not seen off for a day is given up
+                if now > start + (payload.HEAT_RESTORE_GIVE_UP_S if lease.target == "restore" and not lease.zero else LEASE_GIVE_UP_S):  # ponytail: a device not seen off for a day is given up
                     await self._drop(eid, lease, "lease_cancelled", None)
+                    continue
+                if lease.zero:  # DIV-009
+                    await self._zero_due(eid, lease)
                     continue
                 if lease.target == "restore":  # HA-014: before the "off" test below: for a climate "off" is a mode, not the lease's end
                     await self._restore_due(eid, lease)
@@ -1170,6 +1176,20 @@ class CommandRunner:
         elif eid in self.leases.items:
             self.off_sent[eid] = time.monotonic()
 
+    async def _zero_due(self, eid: str, lease: payload.Lease) -> None:
+        """DIV-009: a diverter's number after its lease end: 0 is written at most once a minute until a poll shows it. It stays due for a poll, a real change
+        (heat_changed), not_controllable or the day (lease_tick)."""
+        seen = self.seen(eid)
+        if seen is None or seen.state in ("unavailable", "unknown"):
+            return  # retried at the next check
+        echo = self.env.zero_echoes.get(eid)
+        if payload.heat_verdict(lease, seen)[0] == "ended":
+            if payload.zero_lease_polled(echo, self.last_reported(eid)):
+                await self._drop(eid, lease, "lease_ended", "restart" if eid in self.restarted else None)
+            return
+        if payload.zero_write_due(echo, self.env.wall(), LEASE_OFF_RETRY_S):
+            await payload.restore(eid, lease, self.env)
+
     async def _drop(self, eid: str, lease: payload.Lease, outcome: str, reason: str | None) -> None:
         self.leases.cancel(eid)
         await self.save()
@@ -1186,7 +1206,7 @@ class CommandRunner:
         if lease is None or old is None or new is None or new.state in ("unavailable", "unknown"):
             return  # no lease, HA starting or the entity gone: not a change by anyone
         if lease.target == "restore":  # HA-014: before the "off" test below: a climate's "off" is a mode
-            self.heat_changed(eid, lease, new)
+            self.heat_changed(eid, lease, new, old)
             return
         if new.state == "off" and lease.until <= time.time():
             # The lease's own off, confirmed late (perhaps under another context): the lease ends here, so a later hand "on" finds
@@ -1208,9 +1228,12 @@ class CommandRunner:
         self.hass.async_create_task(self.save(), "SunnyHome lease save")
         self.report(lease.command, "lease_cancelled", "outside_change")
 
-    def heat_changed(self, eid: str, lease: payload.Lease, new) -> None:
+    def heat_changed(self, eid: str, lease: payload.Lease, new, old) -> None:
         """HA-014: a change that leaves what a restore lease set, and is not SunnyHome's own, ends the lease without a restore (outside_change).
-        While a command or a restore runs on the entity (its lock is held) nothing counts; the lease check sees what is left."""
+        While a command or a restore runs on the entity (its lock is held) nothing counts; the lease check sees what is left.
+        DIV-009: for a zero lease only a real change counts: not an attribute-only event, nor a number coming back from unavailable at any value."""
+        if lease.zero and (old.state == new.state or old.state in ("unavailable", "unknown")):
+            return
         seen = self.seen_of(new)
         if payload.at_target(lease, seen):
             return  # a confirmation, or an attribute that is not the lease's (the current temperature, the action)
@@ -1220,6 +1243,8 @@ class CommandRunner:
         if ours is not None and ours in (new.context.id, new.context.parent_id):
             return
         if lease.until <= time.time() and payload.heat_verdict(lease, seen)[0] == "ended":
+            if lease.zero:  # DIV-009: an optimistic 0 under another context: the tick waits for a poll
+                return
             # PLAN-031 integration: the restore, confirmed late (perhaps under another context): the lease ends here, as a switch's late off does.
             self.leases.cancel(eid)
             self.off_sent.pop(eid, None)

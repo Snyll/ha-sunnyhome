@@ -690,6 +690,7 @@ _BACK_REQUIRED = frozenset({"option", "value", "preset", "low", "high"})  # HA-0
 AIR_ACTIONS = {"set_fan_mode": ("fanMode", "fanModes", "fan_mode"),
                "set_swing_mode": ("swingMode", "swingModes", "swing_mode"),
                "set_swing_horizontal_mode": ("swingHorizontalMode", "swingHorizontalModes", "swing_horizontal_mode")}
+ZERO_TOLERANCE = 1  # DIV-009: how far a number under a zero lease may read from what it set and still show it, the percent the server's diverter tolerance allows
 HEAT_RESTORE_GIVE_UP_S = 3600  # a restore not confirmed within an hour of the lease end is given up (a try puts back only what still shows the lease's value)
 _UNAVAILABLE = ("unavailable", "unknown")
 LEASE_MIN_S, LEASE_MAX_S = 60, 3600
@@ -707,6 +708,7 @@ class Command(NamedTuple):
     mode: str | None = None  # HA-014: set_mode's mode, or set_temperature's optional mode (a restore: the previous mode); HA-021: the option or preset
     value_high: float | None = None  # HA-021: a range set_temperature's high target
     back: dict | None = None  # HA-021: a restore's values per lease key (heat_verdict), which service_calls and reached read
+    zero: bool = False  # DIV-009: a diverter's leased set_value: the lease ends in 0, whatever the number showed before
 
 
 class Seen(NamedTuple):
@@ -733,6 +735,8 @@ class Env(NamedTuple):
     dispatch_many: Callable[[list], asyncio.Future] | None = None  # HA-014: several service calls in one task and one context (None: chained over dispatch)
     save: Callable[[], Awaitable] | None = None  # persists the leases; awaited before a leased service call
     wall: Callable[[], float] = time.time  # the lease clock (UTC seconds), persisted across restarts
+    zero_echoes: dict | None = None  # DIV-009: entity id -> (the write's own last_reported, when the reading is released), shared with the pusher
+    reported: Callable[[str], float | None] | None = None  # DIV-009: an entity's last_reported (UTC seconds)
 
 
 def is_heat(entity_id: object) -> bool:
@@ -755,13 +759,15 @@ def parse_command(item: object) -> tuple[str | None, Command | None]:
         return None, None
     entity_id, action, level, ttl, lease = (item.get(key) for key in ("entityId", "action", "level", "ttlMs", "leaseS"))
     leasing = type(lease) is int and LEASE_MIN_S <= lease <= LEASE_MAX_S
+    # DIV-009: the marker of a diverter's level, only on a leased set_value of a number; anywhere else, or anything but true, is an unknown key
+    zero = item.get("zeroAtEnd") is True and action == "set_value" and leasing and isinstance(entity_id, str) and entity_id.startswith("number.")
     if restorable(entity_id):  # HA-014: set_temperature (a lease and a mode are optional), set_mode and the lease renewal and cancel; never on, off or level
         value, mode, high = item.get("value"), item.get("mode"), item.get("valueHigh")
         climate = entity_id.startswith("climate.")
         own = SETTING_ACTIONS.get(entity_id.split(".", 1)[0])  # HA-021: a select's select_option, a number's set_value; None for a heat entity
         low_n, high_n = _heat_number(value), _heat_number(high)
         valid = (
-            item.keys() in _HEAT_SHAPES and level is None and type(ttl) is int and ttl >= 0
+            (item.keys() - {"zeroAtEnd"} if zero else item.keys()) in _HEAT_SHAPES and level is None and type(ttl) is int and ttl >= 0
             and (high is None or action == "set_temperature" and climate and low_n is not None and high_n is not None and low_n <= high_n)  # HA-021 (D7): a range
             and (own is None and action == "set_temperature" and low_n is not None and (mode is None or _heat_text(mode) is not None) and (lease is None or leasing)
                  or own is None and action == "set_mode" and value is None and _heat_text(mode) is not None and lease is None
@@ -774,7 +780,7 @@ def parse_command(item: object) -> tuple[str | None, Command | None]:
                  or action == "lease_cancel" and value is None and mode is None and lease is None)
         )
         value = low_n if action == "set_temperature" else _number(value) if action == "set_value" else None
-        return cid, (Command(cid, entity_id, action, None, ttl, lease, value, mode, high_n) if valid else None)
+        return cid, (Command(cid, entity_id, action, None, ttl, lease, value, mode, high_n, None, zero) if valid else None)
     valid = (
         item.keys() in (_COMMAND_KEYS, _LEASED_KEYS)
         and isinstance(entity_id, str) and _ENTITY_ID.fullmatch(entity_id) is not None
@@ -946,6 +952,8 @@ async def execute(cmd: Command, until: float, env: Env) -> tuple[str, str | None
                     # The previous values are read before anything is written; an entity that shows none gets no lease (and is refused below).
                     if (seen := env.state(eid)) is not None and seen.heat is not None and seen.state not in _UNAVAILABLE:
                         env.leases.grant_restore(eid, cmd, seen, env.wall())
+                        if cmd.zero and env.zero_echoes is not None:
+                            env.zero_echoes.pop(eid, None)  # a level right after an off is not withheld until the off's bound
                         await env.save()
                 else:
                     env.leases.grant(eid, cmd.id, cmd.lease_s, cmd.action, cmd.level, env.wall())
@@ -1026,6 +1034,8 @@ def _refusal(cmd: Command, until: float, env: Env) -> str | None:
         if cmd.action in ("select_option", "set_preset_mode"):  # HA-021: only an option or preset the entity lists now (the text, never an index)
             return None if cmd.mode in seen.heat.get("options" if cmd.action == "select_option" else "presetModes", ()) else "mode_unsupported"
         if cmd.action == "set_value":  # HA-021: within the number's own min and max, on its step grid
+            if cmd.zero and (seen.heat.get("min") != 0 or seen.heat.get("max") != 100):
+                return "out_of_range"  # DIV-009 (D11): exactly 0-100, never scaled
             return None if in_range(cmd.value, seen.heat, from_min=True) else "out_of_range"
         if cmd.action == "set_temperature" and cmd.value_high is not None:  # HA-021 (D7): a range climate, both ends in range and low <= high
             if "targetLow" not in seen.heat or not (in_range(cmd.value, seen.heat) and in_range(cmd.value_high, seen.heat)) or cmd.value > cmd.value_high:
@@ -1052,6 +1062,12 @@ async def _lease_command(cmd: Command, until: float, env: Env) -> tuple[str, str
             env.leases.items[cmd.entity_id] = lease._replace(until=min(lease.until, env.wall()))
             await env.save()
             outcome = await _restore_locked(cmd.entity_id, env.leases.items[cmd.entity_id], env)
+            if lease.zero:  # DIV-009: stays due until a poll shows 0, so the lease check decides; only out of SunnyHome's hands ends it here
+                if outcome[1] != "not_controllable":
+                    return "done", None, False
+                env.leases.cancel(cmd.entity_id)
+                await env.save()
+                return "done", outcome[1], False
             if outcome[0] == "done" or outcome[1] in ("outside_change", "not_controllable", "restore_invalid"):
                 env.leases.cancel(cmd.entity_id)
                 await env.save()
@@ -1077,6 +1093,8 @@ def heat_verdict(lease: "Lease", seen: Seen | None) -> tuple[str, Command | None
     heat = seen.heat if seen is not None else None
     if heat is None:
         return "cancelled", None
+    if lease.zero:  # DIV-009: 0 or a write of 0, whatever it shows: only a real change event (the runner's heat_changed) ends such a lease
+        return ("ended", None) if _shows("value", 0.0, heat) else ("restore", Command(lease.command, "", "restore", None, 0, back={"value": 0.0}))
     back = {}
     for key, want in lease.set.items():
         if want is None:
@@ -1127,20 +1145,27 @@ async def _restore_locked(eid: str, lease: "Lease", env: Env) -> tuple[str, str 
         return "failed", "outside_change", False
     if cmd is None:
         return "done", None, False
-    if not back_valid(cmd.back, seen.heat):
+    if not lease.zero and not back_valid(cmd.back, seen.heat):  # DIV-009: a range change that refuses 0 is retried until the day's give-up, not dropped
         return "failed", "restore_invalid", False
     cmd = cmd._replace(entity_id=eid)
     calls = service_calls(cmd, seen)
     task = None
+    echoes = env.zero_echoes if lease.zero else None
+    if echoes is not None:
+        echoes[eid] = (math.inf, env.wall() + GENERIC_CONFIRM_S)  # before the dispatch: a push during the watch must not send the optimistic 0 as a reading
     try:
-        if len(calls) == 1:
-            task = env.dispatch(*calls[0])
-        elif calls:
-            task = (env.dispatch_many or partial(_chain, env.dispatch))(calls)
-    except Exception as err:  # raised before the service ran
-        _LOGGER.debug("Service call refused: %s", type(err).__name__)
-        return "failed", "service_error", False
-    return await _watch(cmd, task, env)
+        try:
+            if len(calls) == 1:
+                task = env.dispatch(*calls[0])
+            elif calls:
+                task = (env.dispatch_many or partial(_chain, env.dispatch))(calls)
+        except Exception as err:  # raised before the service ran
+            _LOGGER.debug("Service call refused: %s", type(err).__name__)
+            return "failed", "service_error", False
+        return await _watch(cmd, task, env)
+    finally:
+        if echoes is not None:
+            echoes[eid] = ((env.reported(eid) or 0.0) if env.reported is not None else 0.0, echoes[eid][1])
 
 
 async def restore(eid: str, lease: "Lease", env: Env) -> tuple[str, str | None, bool]:
@@ -1162,13 +1187,32 @@ class Lease(NamedTuple):
     level: int | None
     prev: dict | None = None  # restore: the values to put back, {"temperature", "mode"} (a key the lease does not change is None); HA-021: see _FIELDS
     set: dict | None = None  # restore: the values the lease set, the same shape; the entity must still show them
+    zero: bool = False  # DIV-009: a diverter's lease on a number: it ends in 0 and stays until a poll shows it; stored only when true (an older component ignores the key)
 
 
 def at_target(lease: Lease, seen: Seen | None) -> bool:
     """Whether the entity still shows the lease's target: on; for a level on with the brightness within 1 %; a restore lease: what it set."""
+    if lease.zero:  # DIV-009: the table's tolerance: the backend reads 19.6 as a set 20 too
+        shown = seen.heat.get("value") if seen is not None and seen.heat is not None else None
+        return isinstance(shown, (int, float)) and abs(shown - lease.set["value"]) <= ZERO_TOLERANCE
     if lease.target == "restore":
         return heat_shows(lease.set, seen)
     return reached(Command(lease.command, "", lease.target, lease.level, 0), seen)
+
+
+def zero_lease_polled(echo: tuple | None, reported: float | None) -> bool:
+    """DIV-009: a report past the zero write's own echo, so what the number shows is no longer that write's optimism. After a restart no echo is known, so it counts."""
+    return echo is None or reported is not None and reported > echo[0]
+
+
+def zero_withheld(echo: tuple | None, reported: float | None, now: float) -> bool:
+    """DIV-009: whether the pusher sends the number with no reading: its own zero write's echo, until a report past it or the bound. Release at the bound is no proof: the lease stays due."""
+    return echo is not None and now < echo[1] and not zero_lease_polled(echo, reported)
+
+
+def zero_write_due(echo: tuple | None, now: float, retry_s: float) -> bool:
+    """DIV-009: at most one write of 0 per retry_s, whichever path wrote it (a cancel or the lease check)."""
+    return echo is None or now >= echo[1] - GENERIC_CONFIRM_S + retry_s
 
 
 _CHECKS = {"temperature": _heat_number, "low": _heat_number, "high": _heat_number, "mode": _heat_text, "preset": _heat_text, "option": _option_text, "value": _number}
@@ -1196,7 +1240,7 @@ class Leases:
         self.items: dict[str, Lease] = {}
         for eid, item in (data or {}).items():
             try:
-                lease = Lease(float(item["until"]), str(item["command"]), item["target"], item.get("level"), _spec(item.get("prev"), eid), _spec(item.get("set"), eid))
+                lease = Lease(float(item["until"]), str(item["command"]), item["target"], item.get("level"), _spec(item.get("prev"), eid), _spec(item.get("set"), eid), item.get("zero") is True)
             except (KeyError, TypeError, ValueError, AttributeError):
                 continue  # a damaged entry is dropped, never guessed
             if not isinstance(eid, str):
@@ -1216,6 +1260,9 @@ class Leases:
         values: a rule changing its mind must never record the already-raised values as the previous ones.
         HA-021 (§2g): the same per key for a select's option, a number's value, a climate's preset and range (low, high); a climate's or water heater's
         lease keeps {"temperature", "mode"} and adds the other keys only while it sets them (the 0.19.0 store shape for a heat-only lease)."""
+        if cmd.zero:  # DIV-009: 0 goes back whatever the number shows and whatever an earlier lease held
+            self.items[eid] = Lease(now + cmd.lease_s, cmd.id, "restore", None, {"value": 0.0}, {"value": cmd.value}, True)
+            return
         heat = seen.heat
         new_set = {**(dict.fromkeys(_HEAT_SPEC) if is_heat(eid) else {}), **_sets(cmd, seen)}
         new_prev = {key: heat.get(_FIELDS[key]) if want is not None else None for key, want in new_set.items()}
@@ -1241,6 +1288,8 @@ class Leases:
         if seen is None or seen.state in _UNAVAILABLE:
             return "entity_unavailable"  # momentarily gone: the lease stays and keeps running
         if not at_target(lease, seen):
+            if lease.zero:
+                return "not_applied"  # DIV-009: it runs to its real end and writes 0 there
             del self.items[eid]
             return "lease_cancelled"
         self.items[eid] = lease._replace(until=now + seconds, command=command)
@@ -1254,7 +1303,7 @@ class Leases:
 
     def to_dict(self) -> dict:
         # an on/level lease keeps its 0.15 shape (no prev/set), so a downgrade reads it as before
-        return {eid: {k: v for k, v in lease._asdict().items() if lease.target == "restore" or k not in ("prev", "set")} for eid, lease in self.items.items()}
+        return {eid: {k: v for k, v in lease._asdict().items() if (lease.target == "restore" or k not in ("prev", "set")) and (k != "zero" or v)} for eid, lease in self.items.items()}
 
 
 def _finished(inflight: dict, eid: str, task: asyncio.Future) -> None:
