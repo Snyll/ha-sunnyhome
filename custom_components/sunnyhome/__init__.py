@@ -176,7 +176,7 @@ def generic_config(hass: HomeAssistant, entry: ConfigEntry) -> payload.GenericCo
     if state is None:
         return None
     rng = payload.generic_range(state.attributes.get("min"), state.attributes.get("max")) or (None, None, False)
-    return payload.GenericConfig(wallbox.number, wallbox.switch, *rng)
+    return payload.GenericConfig(wallbox.number, wallbox.switch, *rng, *payload.generic_grid(state.attributes))
 
 
 def deye_entries(hass: HomeAssistant) -> list[ConfigEntry]:
@@ -364,6 +364,15 @@ def device_choices(hass: HomeAssistant, ow: frozenset[str]) -> list[tuple[str, s
 def device_control(hass: HomeAssistant, entry: ConfigEntry) -> set[str]:
     """HA-021 (D2): the controllable kinds of the whole devices (switch, light, heat, select, number), whatever their state: the lease watcher's part."""
     return {ent.entity_id for ent in device_entities(hass, entry) if ent.domain in CONTROL_DOMAINS}
+
+
+def role_only(hass: HomeAssistant, entry: ConfigEntry, eid: str) -> bool:
+    """RV-57 (A-05): a controllable entity of a ticked device that only the Energy dashboard took out of the share (D6): the owner did not take it out of SunnyHome's hands."""
+    registry, excluded, ow = er.async_get(hass), unshared_entries(hass), other_wallbox_ids(entry.options)
+    ent = registry.async_get(eid)
+    if ent is None or ent.domain not in CONTROL_DOMAINS or ent.device_id not in (entry.options.get(CONF_DEVICES) or []) or whole_device(registry, ent.device_id, excluded, energy_roles(hass), ow) is not None:
+        return False
+    return any(item.entity_id == eid for item in whole_device(registry, ent.device_id, excluded, {}, ow) or ())
 
 
 def controllable(hass: HomeAssistant, entry: ConfigEntry) -> set[str]:
@@ -1123,8 +1132,14 @@ class CommandRunner:
         try:
             now = time.time()
             for eid, lease in self.leases.due(now):
-                if eid not in controllable(self.hass, self.entry):  # the user took the device out of SunnyHome's hands: left as it is
-                    await self._drop(eid, lease, "lease_cancelled", "not_controllable")
+                env = self.env
+                if eid not in controllable(self.hass, self.entry):
+                    if not role_only(self.hass, self.entry, eid):  # the user took the device out of SunnyHome's hands: left as it is
+                        await self._drop(eid, lease, "lease_cancelled", "not_controllable")
+                        continue
+                    env = self.env._replace(allowed=lambda _: True)  # RV-57 (A-05): a role change ends the lease the normal way
+                if lease.target == "restore" and not lease.zero and ((seen := self.seen(eid)) is None or seen.state in ("unavailable", "unknown")):
+                    self.checked[eid] = now  # RV-57 (A-03): the give-up hour counts only while the entity can take the restore
                     continue
                 # HA-021 (§2g): counted from the later of the lease end and the first check that saw it due, so a lease that ended during a long HA outage
                 # still gets its restore (or off), reported as restart
@@ -1133,10 +1148,10 @@ class CommandRunner:
                     await self._drop(eid, lease, "lease_cancelled", None)
                     continue
                 if lease.zero:  # DIV-009
-                    await self._zero_due(eid, lease)
+                    await self._zero_due(eid, lease, env)
                     continue
                 if lease.target == "restore":  # HA-014: before the "off" test below: for a climate "off" is a mode, not the lease's end
-                    await self._restore_due(eid, lease)
+                    await self._restore_due(eid, lease, env)
                     continue
                 seen = self.seen(eid)
                 if seen is None or seen.state in ("unavailable", "unknown"):
@@ -1147,26 +1162,23 @@ class CommandRunner:
                 if time.monotonic() < self.off_sent.get(eid, -LEASE_OFF_RETRY_S) + LEASE_OFF_RETRY_S:
                     continue  # an off is on its way or was just not confirmed: wait for the readback
                 off = payload.Command(str(uuid.uuid4()), eid, "off", None, payload.TTL_MAX_MS)
-                outcome = (await payload.execute(off, time.monotonic() + payload.TTL_MAX_MS / 1000, self.env))[0]
+                outcome = (await payload.execute(off, time.monotonic() + payload.TTL_MAX_MS / 1000, env))[0]
                 if outcome == "done":
                     await self._drop(eid, lease, "lease_ended", "restart" if eid in self.restarted else None)
-                else:  # execute ended the lease before its checks: put it back until the device is seen off
+                else:  # execute ended the lease at its dispatch: put it back until the device is seen off
                     self.leases.items[eid] = lease
                     await self.save()
                     self.off_sent[eid] = time.monotonic()
         finally:
             self.ticking = False
 
-    async def _restore_due(self, eid: str, lease: payload.Lease) -> None:
+    async def _restore_due(self, eid: str, lease: payload.Lease, env: payload.Env) -> None:
         """HA-014: a restore lease that ended: the previous target and mode go back where the entity still shows what the lease set (ended
         when it shows the previous values already); anything else was changed by hand (cancelled, nothing restored). A restore that is not
         confirmed keeps the lease; it is tried again after a minute, for at most an hour (HEAT_RESTORE_GIVE_UP_S)."""
-        seen = self.seen(eid)
-        if seen is None or seen.state in ("unavailable", "unknown"):
-            return  # retried at the next check
         if time.monotonic() < self.off_sent.get(eid, -LEASE_OFF_RETRY_S) + LEASE_OFF_RETRY_S:
             return
-        outcome, reason, _ = await payload.restore(eid, lease, self.env)
+        outcome, reason, _ = await payload.restore(eid, lease, env)
         if outcome == "done":
             await self._drop(eid, lease, "lease_ended", "restart" if eid in self.restarted else None)
         elif reason == "lease_changed":
@@ -1176,7 +1188,7 @@ class CommandRunner:
         elif eid in self.leases.items:
             self.off_sent[eid] = time.monotonic()
 
-    async def _zero_due(self, eid: str, lease: payload.Lease) -> None:
+    async def _zero_due(self, eid: str, lease: payload.Lease, env: payload.Env) -> None:
         """DIV-009: a diverter's number after its lease end: 0 is written at most once a minute until a poll shows it. It stays due for a poll, a real change
         (heat_changed), not_controllable or the day (lease_tick)."""
         seen = self.seen(eid)
@@ -1188,7 +1200,7 @@ class CommandRunner:
                 await self._drop(eid, lease, "lease_ended", "restart" if eid in self.restarted else None)
             return
         if payload.zero_write_due(echo, self.env.wall(), LEASE_OFF_RETRY_S):
-            await payload.restore(eid, lease, self.env)
+            await payload.restore(eid, lease, env)
 
     async def _drop(self, eid: str, lease: payload.Lease, outcome: str, reason: str | None) -> None:
         self.leases.cancel(eid)
@@ -1217,6 +1229,8 @@ class CommandRunner:
             self.report(lease.command, "lease_ended", "restart" if eid in self.restarted else None)
             self.restarted.discard(eid)
             return
+        if old.state in ("unavailable", "unknown") and new.state == "off":
+            return  # RV-57 (A-04): a restart back off is no hand change: the lease runs on, its end or the rule's next on settles it
         attrs = new.attributes
         seen = payload.Seen(new.state, attrs.get("brightness"), new.domain == "light" and brightness_supported(attrs.get("supported_color_modes")), False)
         if payload.at_target(lease, seen):
@@ -1241,6 +1255,8 @@ class CommandRunner:
             return
         ours = self.contexts.get(eid)
         if ours is not None and ours in (new.context.id, new.context.parent_id):
+            return
+        if lease.zero and self.leases.late_poll(eid, seen, time.time()):
             return
         if lease.until <= time.time() and payload.heat_verdict(lease, seen)[0] == "ended":
             if lease.zero:  # DIV-009: an optimistic 0 under another context: the tick waits for a poll

@@ -690,8 +690,8 @@ _BACK_REQUIRED = frozenset({"option", "value", "preset", "low", "high"})  # HA-0
 AIR_ACTIONS = {"set_fan_mode": ("fanMode", "fanModes", "fan_mode"),
                "set_swing_mode": ("swingMode", "swingModes", "swing_mode"),
                "set_swing_horizontal_mode": ("swingHorizontalMode", "swingHorizontalModes", "swing_horizontal_mode")}
-ZERO_TOLERANCE = 1  # DIV-009: how far a number under a zero lease may read from what it set and still show it, the percent the server's diverter tolerance allows
-HEAT_RESTORE_GIVE_UP_S = 3600  # a restore not confirmed within an hour of the lease end is given up (a try puts back only what still shows the lease's value)
+ZERO_TOLERANCE = 1.5  # DIV-009: how far a number under a zero lease may read from what it set and still show it: the server's diverter tolerance of 1 % on the rounded value (RV-56)
+HEAT_RESTORE_GIVE_UP_S = 3600  # a restore not confirmed within an hour of the lease end, not counting time the entity is unavailable, is given up (a try puts back only what still shows the lease's value)
 _UNAVAILABLE = ("unavailable", "unknown")
 LEASE_MIN_S, LEASE_MAX_S = 60, 3600
 _LOGGER = logging.getLogger(__name__)
@@ -933,8 +933,8 @@ async def execute(cmd: Command, until: float, env: Env) -> tuple[str, str | None
     Single writer per entity across entries and reloads: the per-entity lock keeps claim order, and a
     command waits for the entity's previous service call (never cancelled) before its own checks.
     "failed" only when nothing was dispatched; after dispatch only "done" (target observed) or "unknown".
-    AUTO-004: a leased on/level records its lease (saved) before its checks and drops it again when refused;
-    every other command for the entity ends the entity's lease; lease_renew and lease_cancel call no service.
+    AUTO-004: a leased on/level records its lease (saved) before its checks; every other command for the entity ends the entity's lease, right at its
+    dispatch; lease_renew and lease_cancel call no service. RV-43: a refused command changes nothing: the entity's earlier lease stays as it was, for every entity type.
     HA-014: a leased set_temperature records a restore lease (the previous target and mode, read first, and the values it sets).
     HA-021 (§2g): so does a leased select_option, set_value, set_preset_mode or range set_temperature (per key: option, value, preset, low and high).
     """
@@ -952,21 +952,20 @@ async def execute(cmd: Command, until: float, env: Env) -> tuple[str, str | None
                     # The previous values are read before anything is written; an entity that shows none gets no lease (and is refused below).
                     if (seen := env.state(eid)) is not None and seen.heat is not None and seen.state not in _UNAVAILABLE:
                         env.leases.grant_restore(eid, cmd, seen, env.wall())
-                        if cmd.zero and env.zero_echoes is not None:
-                            env.zero_echoes.pop(eid, None)  # a level right after an off is not withheld until the off's bound
                         await env.save()
                 else:
                     env.leases.grant(eid, cmd.id, cmd.lease_s, cmd.action, cmd.level, env.wall())
                     await env.save()  # saved before the call: a crash right after it never leaves an on without its lease
-            elif env.leases.cancel(eid) is not None:
-                await env.save()
         # No await from here to the dispatch: the checks hold when the call starts.
         refusal = _refusal(cmd, until, env)
         if refusal is None and leased and restorable(eid) and (lease := env.leases.items.get(eid)) is not None and lease.command == cmd.id \
                 and any(lease.prev.get(key) is None for key, want in lease.set.items() if want is not None and key in _BACK_REQUIRED):
             refusal = "restore_invalid"  # HA-021 (§2g): nothing to put back at the lease end, so the rule's value would stay
         task = None
+        ended = False
         if refusal is None:
+            if not leased and env.leases is not None:
+                ended = env.leases.cancel(eid) is not None  # before the call: its state change finds no lease (eager dispatch); put back below if the call does not start
             try:
                 calls = service_calls(cmd, env.state(eid))
                 if len(calls) == 1:
@@ -976,14 +975,22 @@ async def execute(cmd: Command, until: float, env: Env) -> tuple[str, str | None
             except Exception as err:  # raised before the service ran, so nothing was switched
                 _LOGGER.debug("Service call refused: %s", type(err).__name__)
                 refusal = "service_error"
+        if refusal is None and leased and cmd.zero and env.zero_echoes is not None:
+            env.zero_echoes.pop(eid, None)  # a level right after an off is not withheld until the off's bound
         if refusal is not None:
-            if leased:
-                if before is not None and restorable(eid):
-                    env.leases.items[eid] = before  # the earlier restore lease still holds the real previous values
+            if env.leases is not None and env.leases.items.get(eid) is not before:
+                if before is not None:
+                    env.leases.items[eid] = before  # RV-43: the earlier lease still runs (a restore lease: it still holds the real previous values)
                 else:
                     env.leases.cancel(eid)
-                await env.save()
+                if leased:  # an unleased command never saved its cancel
+                    await env.save()
             return "failed", refusal, False
+        if ended:
+            try:
+                await env.save()
+            except Exception as err:  # the call has started and must reach its result; a stale store only keeps an ended lease until its end
+                _LOGGER.debug("Lease save failed: %s", type(err).__name__)
         return await _watch(cmd, task, env)
 
 
@@ -1053,7 +1060,7 @@ def _refusal(cmd: Command, until: float, env: Env) -> str | None:
 
 
 async def _lease_command(cmd: Command, until: float, env: Env) -> tuple[str, str | None, bool]:
-    """AUTO-004: a renewal extends only an active lease whose entity is still at its target; a cancel ends the lease (done also when none).
+    """AUTO-004: a renewal extends only an active lease whose entity is still at its target; a cancel ends the lease (done also when none, RV-57: saying so).
     HA-014: a cancel of a restore lease puts the previous target and mode back first (the rule's condition ended); a restore that does not
     complete leaves the lease due, so the lease check retries it."""
     if cmd.action == "lease_cancel":
@@ -1073,7 +1080,10 @@ async def _lease_command(cmd: Command, until: float, env: Env) -> tuple[str, str
                 await env.save()
             if outcome[1] in ("outside_change", "not_controllable", "restore_invalid"):  # HA-021 (§2g): done, but nothing was put back, and why (AUTO-028 post review: not_controllable too)
                 return "done", outcome[1], False
-        elif env.leases is not None and env.leases.cancel(cmd.entity_id) is not None:
+        elif lease is None:
+            return "done", "no_lease", False  # RV-57 (A-03): nothing was put back, so the backend logs no restore
+        else:
+            env.leases.cancel(cmd.entity_id)
             await env.save()
         return "done", None, False
     if env.clock() >= until:
@@ -1238,6 +1248,7 @@ class Leases:
 
     def __init__(self, data: dict | None = None) -> None:
         self.items: dict[str, Lease] = {}
+        self.late: dict[str, tuple[float, float]] = {}  # RV-56 (S-06): each zero lease's value before its newest grant and until when a poll may still show it; memory only
         for eid, item in (data or {}).items():
             try:
                 lease = Lease(float(item["until"]), str(item["command"]), item["target"], item.get("level"), _spec(item.get("prev"), eid), _spec(item.get("set"), eid), item.get("zero") is True)
@@ -1261,6 +1272,8 @@ class Leases:
         HA-021 (§2g): the same per key for a select's option, a number's value, a climate's preset and range (low, high); a climate's or water heater's
         lease keeps {"temperature", "mode"} and adds the other keys only while it sets them (the 0.19.0 store shape for a heat-only lease)."""
         if cmd.zero:  # DIV-009: 0 goes back whatever the number shows and whatever an earlier lease held
+            old = self.items.get(eid)
+            self.late[eid] = (old.set["value"] if old is not None and old.zero else 0.0, now + GENERIC_CONFIRM_S)
             self.items[eid] = Lease(now + cmd.lease_s, cmd.id, "restore", None, {"value": 0.0}, {"value": cmd.value}, True)
             return
         heat = seen.heat
@@ -1277,6 +1290,12 @@ class Leases:
                         new_set[key] = held
         keep = [key for key in new_set if key in _HEAT_SPEC or new_set[key] is not None]
         self.items[eid] = Lease(now + cmd.lease_s, cmd.id, "restore", None, {k: new_prev.get(k) for k in keep}, {k: new_set[k] for k in keep})
+
+    def late_poll(self, eid: str, seen: Seen | None, now: float) -> bool:
+        """RV-56 (S-06): whether a zero lease's number shows the value before its newest grant, within the time a real poll of that write takes: an old reading, no hand change."""
+        was = self.late.get(eid)
+        shown = seen.heat.get("value") if seen is not None and seen.heat is not None else None
+        return was is not None and now < was[1] and isinstance(shown, (int, float)) and abs(shown - was[0]) <= ZERO_TOLERANCE
 
     def renew(self, eid: str, command: str, seconds: int, seen: Seen | None, now: float) -> str | None:
         """None when extended; else the failure reason (no lease, it ended, or the entity left its target)."""
@@ -2194,7 +2213,8 @@ class Wallbox:
 GENERIC_READING_KEYS = ("power", "energy", "current", "status")
 MAX_GENERIC_READINGS = 8  # the server's bound
 GENERIC_MIN_A, GENERIC_MAX_A = 6, 32  # the effective range is the number's own min and max cut to these
-GENERIC_NEAR_A = 0.5  # a charger shows a written current within half an ampere (integrations round to their step)
+GENERIC_NEAR_A = 1  # RV-54: a charger shows a written current within the server's tolerance (Current.TOLERANCE_A): integrations round, whatever step they declare
+GENERIC_SAME_A = 0.5  # a value the charger itself showed, or one that needs no write
 GENERIC_CONFIRM_S = WALLBOX_SCAN_MAX_S + WALLBOX_CONFIRM_MARGIN_S  # how long a real poll of a written entity is awaited
 _STATUS = re.compile(r"[A-Za-z0-9 _.-]{1,32}")
 _PLATFORM = re.compile(r"[a-z0-9_]{1,40}")
@@ -2220,6 +2240,8 @@ class GenericConfig(NamedTuple):
     min_a: float | None
     max_a: float | None
     allows_zero: bool  # the number's own min is 0, so a switch-less STOP may write 0
+    step: float | None = None  # RV-54: the number's own step and min, its grid (None: not known, the amps go as they are)
+    grid_from: float = 0
 
 
 def generic_range(low: object, high: object) -> tuple[float, float, bool] | None:
@@ -2230,6 +2252,12 @@ def generic_range(low: object, high: object) -> tuple[float, float, bool] | None
         return None
     start, end = max(own_low, GENERIC_MIN_A), min(own_high, GENERIC_MAX_A)
     return (start, end, own_low <= 0) if start <= end else None
+
+
+def generic_grid(attrs: Mapping) -> tuple[float | None, float]:
+    """RV-54: the number's step (None: no usable one) and the value its grid counts from, its own min (as in_range's from_min)."""
+    step, low = _heat_number(attrs.get("step")), _heat_number(attrs.get("min"))
+    return (step if step is not None and step > 0 else None), (low if low is not None else 0)
 
 
 def other_wallbox_error(power: str | None, current: str | None, attrs: Mapping | None) -> tuple[str, str] | None:
@@ -2330,14 +2358,15 @@ def generic_lease(data: object) -> GenericLease | None:
     return lease if lease.set is not None and lease.prev is not None and any(want is not None for want in lease.set.values()) else None
 
 
-def generic_shows(spec: dict, amps: float | None, on: bool | None) -> bool:
-    """Whether the charger shows every value the spec holds (a None key is not held)."""
-    return all((amps is not None and abs(amps - want) < GENERIC_NEAR_A) if key == "amps" else on is want for key, want in spec.items() if want is not None)
+def generic_shows(spec: dict, amps: float | None, on: bool | None, near: float = GENERIC_NEAR_A) -> bool:
+    """Whether the charger shows every value the spec holds (a None key is not held), the amps within near."""
+    return all((amps is not None and abs(amps - want) <= near) if key == "amps" else on is want for key, want in spec.items() if want is not None)
 
 
 def generic_verdict(lease: GenericLease, amps: float | None, on: bool | None) -> tuple[str, dict | None]:
     """The lease end per held key (heat_verdict's rule): at its previous value it is done, at the value the lease set it is put back, at anything
-    else somebody changed it by hand. ("restore", {key: value to write}) | ("ended", None) | ("cancelled", None)."""
+    else somebody changed it by hand. RV-54: the previous value exactly goes first, as a set value may lie within the tolerance of it; then the set value, then
+    the previous value rounded by the charger. ("restore", {key: value to write}) | ("ended", None) | ("cancelled", None)."""
     back = {}
     for key, want in lease.set.items():
         if want is None:
@@ -2346,11 +2375,11 @@ def generic_verdict(lease: GenericLease, amps: float | None, on: bool | None) ->
         if old is None:  # nothing to put back for this key
             if not generic_shows({key: want}, amps, on):
                 return "cancelled", None
-        elif generic_shows({key: old}, amps, on):
+        elif generic_shows({key: old}, amps, on, GENERIC_SAME_A):
             continue
         elif generic_shows({key: want}, amps, on):
             back[key] = old
-        else:
+        elif not generic_shows({key: old}, amps, on):
             return "cancelled", None
     return ("restore", back) if back else ("ended", None)
 
@@ -2417,17 +2446,24 @@ class GenericWallbox:
             return {"amps": None, "on": False} if cfg.switch else {"amps": 0.0, "on": None}
         return {"amps": float(amps), "on": True if cfg.switch else None}
 
-    def _allowed(self, amps: float, cfg: GenericConfig) -> bool:
+    def _settable(self, amps: float, cfg: GenericConfig) -> float | None:
+        """RV-54: what to write for amps (None: refused, nothing written): 0 as it is; else the value on the number's grid at or below it (never over what was asked, which may be
+        the owner's maximum), inside the range and within the server's tolerance of amps. A number with a coarser step is refused rather than left at a value the backend would not accept."""
         if amps == 0:
-            return bool(cfg.switch) or cfg.allows_zero
-        return cfg.min_a is not None and cfg.min_a - 1e-9 <= amps <= cfg.max_a + 1e-9
+            return amps if cfg.switch or cfg.allows_zero else None
+        if cfg.min_a is None:
+            return None
+        grid = amps if cfg.step is None else round(cfg.grid_from + math.floor((amps - cfg.grid_from) / cfg.step + 1e-9) * cfg.step, 3)
+        if grid < cfg.min_a <= amps:  # the range is cut to 6 A, which need not lie on the number's grid: the charger rounds it
+            grid = cfg.min_a
+        return grid if cfg.min_a - 1e-9 <= grid <= cfg.max_a + 1e-9 and amps - grid <= GENERIC_NEAR_A else None
 
     def _plan(self, cfg: GenericConfig, spec: dict, amps: float | None, on: bool | None) -> list[tuple[str, str, dict, str, object]]:
         """The calls that make the charger show spec: the switch on first, the number (not when it shows it already), a switch off."""
         calls = []
         if spec["on"] is True and on is False:
             calls.append(("switch", "turn_on", {"entity_id": cfg.switch}, "on", True))
-        if spec["amps"] is not None and not generic_shows({"amps": spec["amps"]}, amps, on):
+        if spec["amps"] is not None and not generic_shows({"amps": spec["amps"]}, amps, on, GENERIC_SAME_A):
             calls.append(("number", "set_value", {"entity_id": cfg.number, "value": spec["amps"]}, "amps", spec["amps"]))
         if spec["on"] is False and on is True:
             calls.append(("switch", "turn_off", {"entity_id": cfg.switch}, "on", False))
@@ -2454,9 +2490,9 @@ class GenericWallbox:
                 return "failed", "expired_on_arrival"
             if restore:
                 return await self._restore(cfg, amps, on)
-            if not self._allowed(cmd.amps, cfg):
+            if (settable := self._settable(cmd.amps, cfg)) is None:
                 return "failed", "outside_range"
-            spec = self._target(cmd.amps, cfg)
+            spec = self._target(settable, cfg)
             if cmd.renew:
                 return await self._renew(cmd, sent, cfg, spec, amps, on)
             return await self._apply(cmd, sent, cfg, spec, amps, on)
@@ -2472,7 +2508,8 @@ class GenericWallbox:
         self.lease = GenericLease(cmd.id, now - elapsed + cmd.duration_s, self._merged(spec, keep), prev, now + SETTLE_S)
         self.exit_sent = None
         await self.save()  # armed before the first write: a crash right after it never leaves a change without its lease
-        return await self._write(cfg, self._plan(cfg, spec, amps, on))
+        # RV-54: a repeat over a running lease the charger still shows needs no write: a charger that rounds would be written on every repeat that has no done row to renew
+        return await self._write(cfg, [] if keep and self.lease.set == keep.set else self._plan(cfg, spec, amps, on))
 
     async def _renew(self, cmd: GenericCommand, sent: float, cfg: GenericConfig, spec: dict, amps: float | None, on: bool | None) -> tuple[str, str | None]:
         """Only a live lease whose values are still shown is extended; other amps are written under the same lease (its previous values stay)."""
@@ -2492,14 +2529,14 @@ class GenericWallbox:
     async def _restore(self, cfg: GenericConfig, amps: float | None, on: bool | None) -> tuple[str, str | None]:
         verdict, back = generic_verdict(self.lease, amps, on)
         if verdict == "restore":
-            result = await self._write(cfg, generic_back_calls(cfg, back))
+            result = await self._write(cfg, generic_back_calls(cfg, back), GENERIC_SAME_A)
             if result[0] != "done":
                 return result  # the lease stays (its end is now): the tick puts it back until a real poll shows it
         await self._drop()  # ended, or changed by hand: nothing written
         return "done", None
 
-    async def _write(self, cfg: GenericConfig, calls: list) -> tuple[str, str | None]:
-        """The calls in order, then one confirm window: done only after a real poll of every written entity shows its value."""
+    async def _write(self, cfg: GenericConfig, calls: list, near: float = GENERIC_NEAR_A) -> tuple[str, str | None]:
+        """The calls in order, then one confirm window: done only after a real poll of every written entity shows its value (RV-54: a restore's previous value, one the charger showed itself, exactly)."""
         for domain, service, data, _, _ in calls:
             if not await self._call(domain, service, data):
                 return "unknown", "service_error"
@@ -2511,7 +2548,7 @@ class GenericWallbox:
         while True:
             if all(self._polled(entity_id, echo) for entity_id, echo in echoes.items()):
                 amps, on, _ = self._read(cfg)
-                return ("done", None) if all(generic_shows({key: want}, amps, on) for _, _, _, key, want in calls) else ("unknown", "not_applied")
+                return ("done", None) if all(generic_shows({key: want}, amps, on, near) for _, _, _, key, want in calls) else ("unknown", "not_applied")
             if self.clock() >= end:
                 return "unknown", "no_confirmation"
             await self.sleep(POLL_S)
