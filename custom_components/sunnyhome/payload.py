@@ -42,13 +42,17 @@ PROFILE_KEYS = frozenset({
     # battery_voltage_cell_difference (an unrounded state), SunnyHome derives the difference from high and low
     "cell_voltage_high", "cell_voltage_low", "battery_temp_high", "battery_temp_low",
     "battery_soh", "battery_voltage_charge", "battery_current_charge",
+    # HA-023 (0.27.0): the capacity the BMS reports (input 0x26, Wh; GEN4 total, GEN5/6 "Battery 1 Total Energy" = pack 1) and the
+    # installed battery system capacity (input 0x3A, Wh, GEN4-6); plugin_solax.py at 2026.10.2, both disabled by default
+    "bms_battery_capacity", "battery_system_installed_capacity",
 })
 
 # SRC-009 (0.7.2): profile sensors solax_modbus ships disabled that SunnyHome turns on itself (exact home consumption; HA-022
-# (0.21.0): the BMS readings; 0.22.0: meter 2).
+# (0.21.0): the BMS readings; 0.22.0: meter 2; HA-023 (0.27.0): the battery capacities).
 AUTO_ENABLE_KEYS = frozenset({
     "e_charge_today", "meter_2_measured_power",
     "cell_voltage_high", "cell_voltage_low", "battery_temp_high", "battery_temp_low", "battery_soh",
+    "bms_battery_capacity", "battery_system_installed_capacity",
 })
 
 # SMB-004 (0.8.0): the Growatt, Solis and Sofar hybrids of solax_modbus's plugin_growatt.py, plugin_solis.py (and
