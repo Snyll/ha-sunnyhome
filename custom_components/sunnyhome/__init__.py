@@ -951,7 +951,8 @@ class Pusher:
             self.stopped = True
             _LOGGER.warning("SunnyHome refused the token; pair again with a new code")
             self.entry.async_start_reauth(self.hass)
-        elif v2 and self.unconfirmed and status is not None and 400 <= status < 500 and status != 429:
+        elif v2 and self.unconfirmed and status is not None and 400 <= status < 500 and status not in (404, 429):
+            # 0.27.1: /states never answers 404, so a 404 is a proxy's page during a deploy, not a refused contract
             # HA-021: the stored contract was refused before a 200 confirmed it (a rolled back server: 422, 413, 415, 400 ...; 401 is the token's and
             # a 429 only a busy inflate permit): the 0.19.0 shape for the rest of this run, and the store is cleared so the next start asks again
             self.hdev_off, self.contract, self.unconfirmed = True, False, False
@@ -1419,6 +1420,14 @@ class CommandRunner:
             async with async_get_clientsession(self.hass).post(
                 f"{self.url}/{path}", json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)
             ) as resp:
+                if resp.status == 404:
+                    # 0.27.1: only SunnyHome's own {"error":"not_found"} means control is off / the command is gone; a proxy's
+                    # plain 404 page (a deploy) is a failed request (None): the claim backs off, results and reports retry
+                    try:
+                        answer = await resp.json(content_type=None)
+                    except ValueError:
+                        answer = None
+                    return (404 if isinstance(answer, dict) and answer.get("error") == "not_found" else None), None
                 return resp.status, await resp.json(content_type=None) if resp.status == 200 else None
         except (aiohttp.ClientError, TimeoutError, ValueError) as err:
             _LOGGER.debug("Command %s failed: %s", path, type(err).__name__)
