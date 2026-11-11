@@ -2616,3 +2616,77 @@ class GenericWallbox:
                     if not await self._call(domain, service, data):
                         break
                     self.echoes[data["entity_id"]] = self._shown(data["entity_id"])[1]
+
+
+# PAR-019 (0.28.0): the history before pairing from Home Assistant's own recorder (POST /api/ha/v1/history). SunnyHome holds the cursor and
+# names each window; the component reads it from the recorder and uploads it. Pure helpers: the recorder call itself is in __init__.py.
+HISTORY_KINDS = {"recent": "5minute", "daily": "hour"}  # the only recorder periods ever asked: hourly means never become 5-minute data
+HISTORY_UNITS = {"energy": "kWh", "power": "W"}  # the recorder converts these unit classes, so a Wh counter can never read as kWh
+_ENERGY_UNITS = frozenset({"Wh", "kWh", "MWh", "GWh", "TWh"})
+_POWER_UNITS = frozenset({"W", "kW", "MW", "GW", "TW"})
+_HISTORY_KEY = re.compile(r"[a-z0-9_]{1,64}")
+_WINDOW_KEYS = frozenset({"kind", "from", "to"})
+
+
+def history_unit(unit: object) -> str | None:
+    """The unit a statistic's rows come in once the recorder converted them with HISTORY_UNITS (its own unit otherwise)."""
+    if unit in _ENERGY_UNITS:
+        return HISTORY_UNITS["energy"]
+    if unit in _POWER_UNITS:
+        return HISTORY_UNITS["power"]
+    return unit if isinstance(unit, str) and 0 < len(unit) <= MAX_UNIT else None
+
+
+def parse_window(item: object) -> dict | None:
+    """A window SunnyHome named ({kind, from, to} with a known kind), or None."""
+    if not isinstance(item, dict) or set(item) != _WINDOW_KEYS or item.get("kind") not in HISTORY_KINDS:
+        return None
+    try:
+        start, end = (datetime.fromisoformat(item[key].replace("Z", "+00:00")) for key in ("from", "to"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return dict(item) if start < end else None
+
+
+def history_step(status: int | None, answer: object) -> tuple[str, dict | None]:
+    """What the run does after an answer: ("next", window) uploads that window; ("done", None) ends the run (nothing left); ("stop", None) ends
+    it until the next Home Assistant start (SunnyHome's own 404 {"error":"not_found"}: the route is off or the server older; a refused token or
+    body); ("retry", None) backs off and asks again (not_ready, any other 404 such as a proxy's during a deploy, 429, 5xx, no answer)."""
+    error = answer.get("error") if isinstance(answer, dict) else None
+    if status == 200 and isinstance(answer, dict) and "next" in answer:
+        if answer["next"] is None:
+            return "done", None
+        window = parse_window(answer["next"])
+        return ("next", window) if window else ("stop", None)
+    if status == 409 and error == "window_mismatch" and isinstance(answer, dict):
+        window = parse_window(answer.get("next"))
+        return ("next", window) if window else ("done", None)
+    if status == 404:
+        return ("stop", None) if answer == {"error": "not_found"} else ("retry", None)
+    if status in (200, 400, 401, 403, 413, 415, 422):
+        return "stop", None
+    return "retry", None
+
+
+def history_points(rows: Mapping[str, Sequence[Mapping]], fields: Mapping[str, str]) -> list[dict]:
+    """The upload's points from the recorder rows of each key ({key: [{start, mean|state|sum ...}]}, start a timestamp in seconds or a datetime)
+    and the one field each key is read from: one point per period start, in time order, with only the finite values."""
+    points: dict[float, dict] = {}
+    for key, field in fields.items():
+        if not _HISTORY_KEY.fullmatch(key):
+            continue
+        for row in rows.get(key) or ():
+            value, start = row.get(field), row.get("start")
+            if isinstance(start, datetime):
+                start = start.timestamp()
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and abs(value) < 1e12 \
+                    and isinstance(start, (int, float)):
+                points.setdefault(float(start), {})[key] = value
+    return [{"at": datetime.fromtimestamp(start, UTC).isoformat().replace("+00:00", "Z"), "values": values}
+            for start, values in sorted(points.items()) if values]
+
+
+def history_body(window: dict, units: Mapping[str, str | None], points: list[dict]) -> dict:
+    """POST /api/ha/v1/history: the window as SunnyHome named it, a unit for every key the points carry, the points."""
+    keys = {key for point in points for key in point["values"]}
+    return {"window": window, "units": {key: units.get(key) for key in sorted(keys)}, "points": points}

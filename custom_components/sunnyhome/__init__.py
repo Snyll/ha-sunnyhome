@@ -48,11 +48,15 @@ Energy dashboard uses and the Other wallbox entities are never expanded. The com
 carries "contract":2, then the 0.20.0 shape: gzip, the HA device id and model, config categories, state classes, Energy dashboard roles,
 climate humidity, presets and range targets, and up to 512 entities and 512 sensors. Rule leases also hold a select's option, a number's
 value, a climate's preset and range targets, and put them back at the lease end where nobody changed them by hand.
+PAR-019 (0.28.0): once SunnyHome's states answer carries "history":1, the recorder's statistics of the same profile sensors are uploaded once
+per start (HistoryRun): 5-minute values of the last days and hourly energy sums up to a year back, window by window as SunnyHome asks.
 """
 
 from __future__ import annotations
 
 import asyncio
+import gzip
+import json
 import logging
 import time
 import uuid
@@ -460,6 +464,7 @@ def solax_physical(hass: HomeAssistant) -> payload.PhysicalInverter | None:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await watch_energy(hass)  # HA-021 (D6): before the first push, never in collect()
     pusher = Pusher(hass, entry)
+    pusher.history = HistoryRun(hass, entry, pusher)  # PAR-019: one run per start, once SunnyHome's answer asks for it
     await pusher.load()  # HA-021: the stored contract, so a restart posts the 0.20.0 shape at once
     entry.async_on_unload(async_track_time_interval(hass, pusher.tick, timedelta(seconds=10), name="SunnyHome push"))
     entry.async_on_unload(entry.add_update_listener(_reload))
@@ -581,6 +586,7 @@ class Pusher:
         self.saved = self.unconfirmed = False
         self.delay = 0
         self.retry_at = 0.0
+        self.history: HistoryRun | None = None  # PAR-019: set by async_setup_entry
 
     async def load(self) -> None:
         """HA-021: starts from the stored contract (a damaged store is none)."""
@@ -838,7 +844,7 @@ class Pusher:
         self.trimmed |= len(items) > cap
         return items[:cap]
 
-    def solax(self, hub: ConfigEntry) -> tuple[str | None, list, dict]:
+    def solax(self, hub: ConfigEntry, ids: dict | None = None) -> tuple[str | None, list, dict]:
         """(serial, readings, plugin and manufacturer) of the profile sensors of the single solax_modbus hub. HA-008: the serial and
         manufacturer are the hub's inverter device's (for SolaX the device of a SERIAL_KEYS sensor when it is not found). SMB-004: a
         Growatt, Solis or Sofar hub sends its brand's keys; Growatt's serial is its serialnumber sensor and the device's serial number
@@ -871,11 +877,13 @@ class Pusher:
                 continue
             if serial is None and not brand and key in SERIAL_KEYS and ent.device_id and (device := main_device(self.hass, ent.device_id)):
                 serial = device.serial_number
+            if ids is not None:  # PAR-019: the history run's statistic ids
+                ids[key] = ent.entity_id
             if (state := self.hass.states.get(ent.entity_id)) is not None:
                 readings.append((key, state.attributes.get("unit_of_measurement"), state.state, state.last_reported))
         return serial, readings, info
 
-    def goodwe(self, entry: ConfigEntry) -> tuple[str | None, list]:
+    def goodwe(self, entry: ConfigEntry, ids: dict | None = None) -> tuple[str | None, list]:
         """GW-002: (serial, readings) of the profile sensors of the single goodwe entry. The serial is only in the device registry
         identifiers ("goodwe", <serial>) (the device's serial_number is empty); the key is the <id> of unique_id goodwe-<id>-<serial>."""
         devices = dr.async_get(self.hass)
@@ -891,11 +899,13 @@ class Pusher:
             if (key := payload.goodwe_key(ent.unique_id, ident)) not in payload.GOODWE_KEYS:
                 continue
             serial = ident
+            if ids is not None:  # PAR-019
+                ids[key] = ent.entity_id
             if (state := self.hass.states.get(ent.entity_id)) is not None:
                 readings.append((key, state.attributes.get("unit_of_measurement"), state.state, state.last_reported))
         return serial, readings
 
-    def deye(self, entry: ConfigEntry) -> tuple[str | None, list | None]:
+    def deye(self, entry: ConfigEntry, ids: dict | None = None) -> tuple[str | None, list | None]:
         """DEYE-003: (serial, readings) of the Deye sensors of the single Deye solarman entry, or (None, None) (then "solax": null)
         while the Device sensor or its Serial Number attribute is missing or invalid: the registry serial_number falls back to the
         logger serial, so it is never used. The key is the sensor unique_id <entry id>_<key>_sensor minus prefix and suffix."""
@@ -907,6 +917,8 @@ class Pusher:
             return None, None
         readings = []
         for ent in ents:
+            if (key := payload.deye_key(ent.unique_id, entry.entry_id)) in payload.DEYE_KEYS and ids is not None:  # PAR-019
+                ids[key] = ent.entity_id
             if (key := payload.deye_key(ent.unique_id, entry.entry_id)) in payload.DEYE_KEYS and \
                     (state := self.hass.states.get(ent.entity_id)) is not None:
                 readings.append((key, state.attributes.get("unit_of_measurement"), state.state, state.last_reported))
@@ -933,6 +945,8 @@ class Pusher:
                         answer = None
                     self.answered, self.contract, self.unconfirmed = True, isinstance(answer, dict) and answer.get("contract") == 2, False
                     await self.remember(self.contract)
+                    if isinstance(answer, dict) and answer.get("history") == 1 and self.history is not None:  # PAR-019: SunnyHome takes the history
+                        self.history.start()
                     if not self.contract:  # an old (rolled back) server explains the refusals: a re-deploy's contract switches back without a reload
                         self.hdev_off = self.caps_off = False
                     elif v2:
@@ -1009,6 +1023,109 @@ class Pusher:
             self.delay = min(self.delay * 2 or BACKOFF_MIN, BACKOFF_MAX)
             self.retry_at = time.monotonic() + self.delay
             _LOGGER.debug("Post failed (HTTP %s); next attempt in %s s", status, self.delay)
+
+
+class HistoryRun:
+    """PAR-019 (0.28.0): once per Home Assistant start, after a states answer carried "history":1, the history before pairing from Home Assistant's
+    own recorder: SunnyHome names each window (POST /api/ha/v1/history), the run reads the statistics of the inverter entry's mapped sensors
+    for it and uploads them. "recent": the 5-minute short-term statistics (the mean of a measurement, the state of a counter); "daily": the
+    hourly sum of each counter. Only SunnyHome's own 404 ends it until the next start (an older server or the route off); a proxy 404, 409
+    not_ready, 429 and 5xx back off. Never touches the states push or the command claim; nothing but these statistics is read."""
+
+    START_DELAY_S = 300  # the serial binding SunnyHome runs after the first serial post is done by then
+    PAUSE_S = 2
+    BACKOFF_MIN_S, BACKOFF_MAX_S = 60, 3600
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, pusher: Pusher) -> None:
+        self.hass, self.entry, self.pusher = hass, entry, pusher
+        self.url = f"{entry.data[CONF_URL]}/api/ha/v1/history"
+        self.started = False
+
+    def start(self) -> None:
+        if self.started:
+            return
+        self.started = True
+        self.entry.async_create_background_task(self.hass, self.run(), "SunnyHome history")
+
+    async def run(self) -> None:
+        await asyncio.sleep(self.START_DELAY_S)
+        if "recorder" not in self.hass.config.components:
+            return
+        body, delay = {"window": None}, 0
+        while not self.pusher.stopped:
+            status, answer = await self.send(body)
+            step, window = payload.history_step(status, answer)
+            if step in ("done", "stop"):
+                _LOGGER.debug("History import %s (HTTP %s)", step, status)
+                return
+            if step == "retry":
+                delay = min(delay * 2 or self.BACKOFF_MIN_S, self.BACKOFF_MAX_S)
+                body = {"window": None}
+                await asyncio.sleep(delay)
+                continue
+            delay = 0
+            try:
+                body = await self.read(window)
+            except Exception as err:  # noqa: BLE001 - the recorder's own errors end this run only
+                _LOGGER.debug("History import ended: %s", type(err).__name__)
+                return
+            if body is None:
+                return
+            await asyncio.sleep(self.PAUSE_S)
+
+    async def read(self, window: dict) -> dict | None:
+        """The upload of one window: the mapped sensors' statistics of the single inverter entry (None without exactly one)."""
+        from homeassistant.components.recorder import get_instance
+        from homeassistant.components.recorder.statistics import get_metadata, statistics_during_period
+
+        entries = inverter_entries(self.hass)
+        if len(entries) != 1:
+            return None
+        domain, hub = entries[0]
+        ids: dict[str, str] = {}
+        if domain == SOLAX:
+            self.pusher.solax(hub, ids)
+        elif domain == SOLARMAN:
+            self.pusher.deye(hub, ids)
+        else:
+            self.pusher.goodwe(hub, ids)
+        recorder = get_instance(self.hass)
+        meta = await recorder.async_add_executor_job(partial(get_metadata, self.hass, statistic_ids=set(ids.values())))
+        daily = window["kind"] == "daily"
+        fields, units = {}, {}
+        for key, eid in ids.items():
+            info = (meta.get(eid) or (None, {}))[1]
+            summed, mean = bool(info.get("has_sum")), bool(info.get("has_mean") or info.get("mean_type"))
+            field = ("sum" if summed else None) if daily else ("state" if summed else "mean" if mean else None)
+            if field is not None:
+                fields[key], units[key] = field, payload.history_unit(info.get("unit_of_measurement"))
+        if not fields:  # no statistics yet: an empty upload would move SunnyHome's cursor past the window for good; the next start asks again
+            return None
+        start = datetime.fromisoformat(window["from"].replace("Z", "+00:00")) - (timedelta(hours=1) if daily else timedelta(0))
+        end = datetime.fromisoformat(window["to"].replace("Z", "+00:00"))
+        stats = await recorder.async_add_executor_job(
+            statistics_during_period, self.hass, start, end, {ids[key] for key in fields}, payload.HISTORY_KINDS[window["kind"]], dict(payload.HISTORY_UNITS),
+            {"sum"} if daily else {"mean", "state"})
+        rows = {key: stats.get(ids[key]) or [] for key in fields}
+        return payload.history_body(window, units, payload.history_points(rows, fields))
+
+    async def send(self, body: dict) -> tuple[int | None, object]:
+        """Never logs the token or values. An upload goes gzip-compressed (as a 0.20.0 states post); the ask is plain JSON."""
+        if body.get("window") is None:
+            request = {"json": body, "headers": self.pusher.headers}
+        else:
+            data = await self.hass.async_add_executor_job(partial(gzip.compress, json.dumps(body, separators=(",", ":")).encode(), compresslevel=6, mtime=0))
+            request = {"data": data, "headers": {**self.pusher.headers, "Content-Encoding": "gzip", "Content-Type": "application/json"}}
+        try:
+            async with async_get_clientsession(self.hass).post(self.url, timeout=aiohttp.ClientTimeout(total=60), **request) as resp:
+                try:
+                    answer = await resp.json(content_type=None)
+                except ValueError:
+                    answer = None
+                return resp.status, answer
+        except (aiohttp.ClientError, TimeoutError) as err:
+            _LOGGER.debug("History post failed: %s", type(err).__name__)
+            return None, None
 
 
 class CommandRunner:
