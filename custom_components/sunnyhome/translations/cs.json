@@ -56,6 +56,13 @@
           "heat": "Klimatizace (tepelná čerpadla, termostaty) a ohřívače vody (bojlery): jen režim a teploty. Spolu se sdílenými zařízeními, binárními senzory a lidmi nejvýše 64. Prázdný seznam znamená, že SunnyHome žádné nečte."
         }
       },
+      "hub": {
+        "title": "Střídač pro toto připojení",
+        "description": "Home Assistant má několik střídačů. Každé připojení SunnyHome čte jeden z nich a v SunnyHome z každého vznikne vlastní elektrárna. Vyberte střídač, který toto připojení čte. Pro další střídač přidejte v Home Assistantu další položku SunnyHome (Nastavení, Zařízení a služby, SunnyHome, Přidat položku) s novým kódem ze SunnyHome a vyberte tam ten střídač.\n\nVyberte ho jednou: SunnyHome si ponechá první střídač, který připojení pošle, a jiný později už neuloží. Pro změnu tuto položku odeberte a spárujte znovu. Dokud má Home Assistant několik střídačů, SunnyHome žádný z nich neovládá. Wallbox SolaX posílá jen první položka SunnyHome.",
+        "data": {
+          "inverter_entry": "Střídač, který toto připojení čte"
+        }
+      },
       "inverter": {
         "title": "Ovládání střídače",
         "description": "**Upozornění: SunnyHome tím získá možnost nabíjet a vybíjet vaši domácí baterii přes střídač SolaX.**\n\nKdyž je volba zapnutá, SunnyHome může přepnout střídač vašeho hubu SolaX Modbus do režimu dálkového řízení baterie, vždy na 2 až 10 minut: nabíjení nebo vybíjení nejvýše výkonem uloženým v nastavení baterie v SunnyHome, držení baterie, nebo zákaz vybíjení (ze slunce se baterie nabíjet může). Používá jen entity přímého dálkového řízení hubu a jen tyto režimy. Nic se neodešle, dokud SunnyHome neověří váš model střídače, firmware a verzi SolaX Modbus a dokud ovládání střídače nepovolíte i v SunnyHome.\n\nHome Assistant režim sám ukončí, když ho SunnyHome přestane obnovovat, i po restartu. Když Home Assistant během režimu 3 minuty nic nehlásí, SunnyHome režim ukončí přes cloud SolaX, pokud funguje jeho připojení k vaší elektrárně v cloudu SolaX a ovládání střídače je v SunnyHome povolené. Jinak režim běží dál, dokud se Home Assistant znovu nespustí a neukončí ho; vlastní časový limit střídače ho v našem testu neukončil. Pokud střídač dálkově řídí něco jiného (jiný energetický manažer nebo automatizace), SunnyHome režim nezahájí, a když uvidí jiný režim, ustoupí. Vypnutím této volby se aktivní režim ihned ukončí.",
@@ -99,13 +106,14 @@
       "number_unit": "Číslo nabíjecího proudu musí být v ampérech (A).",
       "number_range": "Číslo nabíjecího proudu potřebuje minimum a maximum, které připouští nějaký proud mezi 6 A a 32 A.",
       "device_not_shareable": "Toto zařízení nelze sdílet celé: patří integraci střídače, baterie nebo energie, používá ho panel Energie, nebo už neexistuje.",
-      "too_many_device_entities": "Celá zařízení a seznamy níže mají dohromady víc než 512 entit nebo 512 senzorů."
+      "too_many_device_entities": "Celá zařízení a seznamy níže mají dohromady víc než 512 entit nebo 512 senzorů.",
+      "inverter_taken": "Tento střídač už čte jiná položka SunnyHome. Vyberte jiný."
     }
   },
   "issues": {
     "multiple_hubs": {
-      "title": "Více integrací střídače zatím není podporováno",
-      "description": "SunnyHome našlo více než jednu položku integrace střídače (SolaX Modbus, GoodWe nebo Deye), proto neodesílá žádná data ze střídače. Ponechte jen jednu a odesílání se obnoví."
+      "title": "Vyberte střídač pro každou položku SunnyHome",
+      "description": "Tato položka SunnyHome nemá střídač ke čtení: Home Assistant má několik střídačů (SolaX Modbus, GoodWe nebo Deye) a žádný není vybraný, nebo vybraný zmizel. Neposílá data ze střídače. Otevřete možnosti položky SunnyHome (Nastavit), vyberte střídač, který čte, a pro každý další střídač přidejte další položku SunnyHome."
     },
     "server_older": {
       "title": "SunnyHome zatím nepřijímá celá zařízení",

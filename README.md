@@ -24,7 +24,9 @@ service for solar homes.
   off again by Home Assistant if SunnyHome stops renewing it for 15 minutes, and a temperature,
   preset, option or number a SunnyHome rule changed is put back, unless you changed it by hand.
 - **Outbound only.** Home Assistant connects out to SunnyHome over HTTPS; nothing is opened to the
-  internet and no Home Assistant credentials are shared. Inverter settings are read, never changed.
+  internet and no Home Assistant credentials are shared. Inverter settings are read; they change only through the two options below.
+- **Battery and wallbox control only if you switch it on**: with the Inverter control option SunnyHome may set the battery mode of a SolaX inverter for a limited time, and with the Wallbox control option the charger's mode and current. Both are off until you tick them.
+- **History import**: once after pairing, the inverter's history that Home Assistant keeps (5-minute values for up to 10 days, hourly sums for up to a year) is sent to SunnyHome.
 
 Requires Home Assistant 2025.1 or newer and a SunnyHome account.
 

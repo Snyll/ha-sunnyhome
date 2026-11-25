@@ -24,11 +24,11 @@ from homeassistant.helpers.selector import (
 )
 
 from . import (
-    binary_shareable, device_choices, heat_controllable, heat_shareable, other_wallbox_ids, payload, person_shareable, sensor_shareable, shareable, solax_charger,
-    solax_remote, unshared_entries,
+    binary_shareable, device_choices, heat_controllable, heat_shareable, inverter_entries, oldest_entry, other_wallbox_ids, payload, person_shareable, sensor_shareable,
+    shareable, solax_charger, solax_remote, unshared_entries,
 )
 from .const import (
-    CONF_BINARY, CONF_CONTROL, CONF_DEVICES, CONF_ENTITIES, CONF_HEAT, CONF_INVERTER, CONF_LINK_ID, CONF_OTHER_WALLBOX, CONF_OW_CURRENT, CONF_OW_ENERGY, CONF_OW_POWER,
+    CONF_BINARY, CONF_CONTROL, CONF_DEVICES, CONF_ENTITIES, CONF_HEAT, CONF_HUB, CONF_INVERTER, CONF_LINK_ID, CONF_OTHER_WALLBOX, CONF_OW_CURRENT, CONF_OW_ENERGY, CONF_OW_POWER,
     CONF_OW_STATUS, CONF_OW_SWITCH, CONF_PEOPLE, CONF_SENSORS, CONF_WALLBOX, DEFAULT_URL, DOMAIN,
 )
 
@@ -143,11 +143,12 @@ class SunnyHomeOptionsFlow(OptionsFlow):
                 errors[CONF_DEVICES] = "too_many_device_entities"
             else:
                 self._data = {CONF_ENTITIES: chosen, CONF_CONTROL: control, CONF_SENSORS: sensors, CONF_BINARY: binary, CONF_PEOPLE: people, CONF_HEAT: heat,
-                              CONF_DEVICES: devices}
-                if solax_remote(self.hass) is None:  # BAT-008: no single hub with all four entities: the option is off
-                    self._data[CONF_INVERTER] = False
-                    return await self._wallbox_or_done()
-                return await self.async_step_inverter()
+                              CONF_DEVICES: devices, CONF_HUB: self.config_entry.options.get(CONF_HUB)}  # HA-027: kept while not asked
+                hubs = {hub.entry_id for _, hub in inverter_entries(self.hass)}
+                stale = self._data[CONF_HUB] and self._data[CONF_HUB] not in hubs  # review P2-3: a gone pick is asked again
+                if len(hubs) > 1 or stale:  # HA-027: which inverter this entry reads
+                    return await self.async_step_hub()
+                return await self._inverter_or_wallbox()
         excluded = unshared_entries(self.hass)  # DEYE-003: a Deye entry's entities are never offered
         options = self._options(lambda ent: shareable(ent, excluded))
         sensor_options = self._options(lambda ent: sensor_shareable(ent, excluded))
@@ -182,6 +183,31 @@ class SunnyHomeOptionsFlow(OptionsFlow):
             step_id="init", data_schema=self.add_suggested_values_to_schema(schema, current), errors=errors
         )
 
+    async def async_step_hub(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """HA-027: with several inverter entries, the one this SunnyHome entry reads (one per entry; another inverter needs another entry)."""
+        errors: dict[str, str] = {}
+        others = self.hass.config_entries.async_entries(DOMAIN)
+        taken = {entry.options.get(CONF_HUB) for entry in others if entry.entry_id != self.config_entry.entry_id} - {None}
+        hubs = [hub for _, hub in inverter_entries(self.hass)]
+        if user_input is not None:
+            picked = user_input.get(CONF_HUB) or None
+            if picked in taken:
+                errors[CONF_HUB] = "inverter_taken"
+            else:
+                self._data[CONF_HUB] = picked
+                return await self._inverter_or_wallbox()
+        options = [SelectOptionDict(value=hub.entry_id, label=f"{hub.title} ({hub.domain})") for hub in hubs]
+        schema = vol.Schema({vol.Optional(CONF_HUB): SelectSelector(SelectSelectorConfig(options=options, mode=SelectSelectorMode.LIST))})
+        current = {CONF_HUB: picked} if (picked := (user_input or self.config_entry.options).get(CONF_HUB)) in {o["value"] for o in options} else {}
+        return self.async_show_form(step_id="hub", data_schema=self.add_suggested_values_to_schema(schema, current), errors=errors)
+
+    async def _inverter_or_wallbox(self) -> ConfigFlowResult:
+        """BAT-008: the inverter-control step only with a single hub that has all four entities; else the option is off."""
+        if solax_remote(self.hass) is None:
+            self._data[CONF_INVERTER] = False
+            return await self._wallbox_or_done()
+        return await self.async_step_inverter()
+
     async def async_step_inverter(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """BAT-008: the separate inverter-control opt-in, off by default, with its own warning."""
         if user_input is not None:
@@ -193,7 +219,7 @@ class SunnyHomeOptionsFlow(OptionsFlow):
     async def _wallbox_or_done(self) -> ConfigFlowResult:
         """EV-004: the Wallbox control step only with one EV-charger hub that has its three selects; else the option is off.
         WALLBOX-005: the Other wallbox step follows either way."""
-        if solax_charger(self.hass) is None:
+        if solax_charger(self.hass) is None or not oldest_entry(self.hass, self.config_entry):  # HA-027 review P2-4: the entry that posts it
             self._data[CONF_WALLBOX] = False
             return await self.async_step_other_wallbox()
         return await self.async_step_wallbox()

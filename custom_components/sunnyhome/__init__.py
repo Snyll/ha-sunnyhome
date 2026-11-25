@@ -82,8 +82,8 @@ from homeassistant.util import dt as dt_util
 
 from . import payload
 from .const import (
-    CONF_BINARY, CONF_CONTROL, CONF_DEVICES, CONF_ENTITIES, CONF_HEAT, CONF_INVERTER, CONF_OTHER_WALLBOX, CONF_OW_CURRENT, CONF_OW_ENERGY, CONF_OW_POWER,
-    CONF_OW_STATUS, CONF_OW_SWITCH, CONF_PEOPLE, CONF_SENSORS, CONF_WALLBOX, DOMAIN, VERSION,
+    CONF_BINARY, CONF_CONTROL, CONF_DEVICES, CONF_ENTITIES, CONF_HEAT, CONF_HUB, CONF_INVERTER, CONF_OTHER_WALLBOX, CONF_OW_CURRENT, CONF_OW_ENERGY,
+    CONF_OW_POWER, CONF_OW_STATUS, CONF_OW_SWITCH, CONF_PEOPLE, CONF_SENSORS, CONF_WALLBOX, DOMAIN, VERSION,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -129,6 +129,25 @@ def inverter_entries(hass: HomeAssistant) -> list[tuple[str, ConfigEntry]]:
     found = [(domain, entry) for domain in INVERTERS for entry in hass.config_entries.async_entries(domain)
              if not (domain == SOLAX and payload.ev_plugin(hub_plugin(entry)))]
     return found + [(SOLARMAN, entry) for entry in deye_entries(hass)]
+
+
+def link_inverter(hass: HomeAssistant, entry: ConfigEntry) -> tuple[str, ConfigEntry] | None:
+    """HA-027: the (domain, entry) of the inverter this SunnyHome entry reads: the one it picked (None once that is gone, never another one, since
+    SunnyHome fixes a link's integration and serial by its first stored post), else the single inverter entry, else None (several, none picked)."""
+    entries = inverter_entries(hass)
+    picked = entry.options.get(CONF_HUB)
+    if picked:
+        return next((found for found in entries if found[1].entry_id == picked), None)
+    # review P2-2: the single one only while no other SunnyHome entry picked it (one inverter is never on two plants)
+    taken = {other.options.get(CONF_HUB) for other in hass.config_entries.async_entries(DOMAIN) if other.entry_id != entry.entry_id}
+    return entries[0] if len(entries) == 1 and entries[0][1].entry_id not in taken else None
+
+
+def oldest_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """HA-027: whether this is the first SunnyHome entry; with one per inverter, only it posts the shared EV chargers, so a wallbox is never stored
+    on several plants."""
+    entries = hass.config_entries.async_entries(DOMAIN)
+    return not entries or entries[0].entry_id == entry.entry_id
 
 
 def charger_hub(hass: HomeAssistant) -> ConfigEntry | None:
@@ -507,8 +526,8 @@ async def _reload(hass: HomeAssistant, entry: ConfigEntry) -> None:
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    ir.async_delete_issue(hass, DOMAIN, ISSUE)
-    for key in (ISSUE_OLD, ISSUE_TRIM):  # HA-021: raised again by the next push if still true
+    ir.async_delete_issue(hass, DOMAIN, ISSUE)  # HA-027: the global id of 0.28.0 and older
+    for key in (ISSUE, ISSUE_OLD, ISSUE_TRIM):  # HA-021: raised again by the next push if still true
         ir.async_delete_issue(hass, DOMAIN, f"{key}_{entry.entry_id}")
     return True
 
@@ -636,14 +655,15 @@ class Pusher:
         """Body with the shared devices; "solax" is null unless exactly one inverter integration entry exists (GW-002: a goodwe
         entry posts "inverter" in its place; DEYE-003: so does a Deye entry with a valid serial, else "solax" stays null).
         HA-021: v2 is the 0.20.0 shape: the whole devices, the new keys and the 512 caps (64/32 after a 413)."""
-        entries = inverter_entries(self.hass)
-        if len(entries) > 1:
+        picked = link_inverter(self.hass, self.entry)
+        # HA-027: per entry, raised while several inverter entries exist and this one has no valid pick, or its pick is gone (review P2-3)
+        if picked is None and (len(inverter_entries(self.hass)) > 1 or self.entry.options.get(CONF_HUB)):
             ir.async_create_issue(
-                self.hass, DOMAIN, ISSUE, is_fixable=False, severity=ir.IssueSeverity.WARNING, translation_key=ISSUE
+                self.hass, DOMAIN, f"{ISSUE}_{self.entry.entry_id}", is_fixable=False, severity=ir.IssueSeverity.WARNING, translation_key=ISSUE
             )
         else:
-            ir.async_delete_issue(self.hass, DOMAIN, ISSUE)
-        domain, hub = entries[0] if len(entries) == 1 else (SOLAX, None)
+            ir.async_delete_issue(self.hass, DOMAIN, f"{ISSUE}_{self.entry.entry_id}")
+        domain, hub = picked or (SOLAX, None)
         solax = hub is not None and domain == SOLAX
         if hub is None:
             serial, readings, info = None, None, None
@@ -672,7 +692,7 @@ class Pusher:
     def wallbox(self) -> dict | None:
         """EV-004: the EV-charger hub's envelope (readings, the work mode select, the control report), or None without one hub.
         Pre review P1-1: the work mode is left out while the select still shows SunnyHome's own write (no real poll since)."""
-        hub = charger_hub(self.hass)
+        hub = charger_hub(self.hass) if oldest_entry(self.hass, self.entry) else None  # HA-027: one SunnyHome entry posts the shared charger
         if hub is None:
             return None
         prefix = f"{hub.options.get('name') or hub.data.get('name')}_"
@@ -1074,14 +1094,14 @@ class HistoryRun:
             await asyncio.sleep(self.PAUSE_S)
 
     async def read(self, window: dict) -> dict | None:
-        """The upload of one window: the mapped sensors' statistics of the single inverter entry (None without exactly one)."""
+        """The upload of one window: the mapped sensors' statistics of this entry's inverter (HA-027: the picked one; None without one)."""
         from homeassistant.components.recorder import get_instance
         from homeassistant.components.recorder.statistics import get_metadata, statistics_during_period
 
-        entries = inverter_entries(self.hass)
-        if len(entries) != 1:
+        picked = link_inverter(self.hass, self.entry)
+        if picked is None:
             return None
-        domain, hub = entries[0]
+        domain, hub = picked
         ids: dict[str, str] = {}
         if domain == SOLAX:
             self.pusher.solax(hub, ids)
@@ -1149,16 +1169,16 @@ class CommandRunner:
         # BAT-008: the inverter lease has its own store; the hub lock is shared by all entries and kept across reloads.
         self.inverter_store = storage.Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.inverter")
         self.inverter = payload.Inverter(
-            shared["locks"].setdefault(SOLAX, asyncio.Lock()), lambda: solax_remote(hass),
+            shared["locks"].setdefault(SOLAX, asyncio.Lock()), lambda: solax_remote(hass) if link_inverter(hass, entry) else None,  # HA-027 review P2-3: never for an entry that reads no inverter
             lambda: bool(entry.options.get(CONF_INVERTER)), self.raw_state, self.dispatch, self.save_inverter,
             lambda command, outcome, reason: self.report(command, outcome, reason, None),
-            reported=self.last_reported, identity=lambda: solax_physical(hass), attribute=self.raw_attribute, limit_entities=lambda: solax_limit(hass),
+            reported=self.last_reported, identity=lambda: solax_physical(hass), attribute=self.raw_attribute, limit_entities=lambda: solax_limit(hass) if link_inverter(hass, entry) else None,
         )
         # EV-004: the wallbox lease has its own store and lock; the echoes (the select's last_reported of SunnyHome's own write) are shared
         # with the pusher, which withholds the work mode until a real poll.
         self.wallbox_store = storage.Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.wallbox")
         self.wallbox = payload.Wallbox(
-            shared["locks"].setdefault(CHARGER_LOCK, asyncio.Lock()), lambda: solax_charger(hass),
+            shared["locks"].setdefault(CHARGER_LOCK, asyncio.Lock()), lambda: solax_charger(hass) if oldest_entry(hass, entry) else None,  # HA-027 review P2-4: the entry that posts the charger
             lambda: bool(entry.options.get(CONF_WALLBOX)), self.select_state, self.dispatch, self.save_wallbox, shared.setdefault("echoes", {}),
         )
         # WALLBOX-005: the Other wallbox lease has its own store and lock too; it shares the echoes with the pusher (the number's own write)
@@ -1531,7 +1551,8 @@ class CommandRunner:
             headers["X-SunnyHome-Component"] = VERSION
         if path == "claim" and self.entry.options.get(CONF_INVERTER):  # BAT-008: inverter commands only while the option is on
             headers["X-SunnyHome-Inverter"] = "1"
-        if path == "claim" and (self.entry.options.get(CONF_WALLBOX) or self.entry.options.get(CONF_OTHER_WALLBOX)):  # EV-004, WALLBOX-005: wallbox commands only while an option is on
+        if path == "claim" and (self.entry.options.get(CONF_WALLBOX) and oldest_entry(self.hass, self.entry)  # HA-027 review P2-4
+                                or self.entry.options.get(CONF_OTHER_WALLBOX)):  # EV-004, WALLBOX-005: wallbox commands only while an option is on
             headers["X-SunnyHome-Wallbox"] = "1"
         try:
             async with async_get_clientsession(self.hass).post(

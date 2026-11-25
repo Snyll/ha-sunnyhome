@@ -56,6 +56,13 @@
           "heat": "Climate entities (heat pumps, thermostats) and water heaters (boilers): only the mode and temperatures. Together with the shared devices, binary sensors and people at most 64. Leave empty and SunnyHome reads none."
         }
       },
+      "hub": {
+        "title": "Inverter for this connection",
+        "description": "Home Assistant has several inverters. Each SunnyHome connection reads one of them, and each becomes its own plant in SunnyHome. Pick the inverter this connection reads. For another inverter, add another SunnyHome entry in Home Assistant (Settings, Devices and services, SunnyHome, Add entry) with a new code from SunnyHome and pick that inverter there.\n\nPick it once: SunnyHome keeps the first inverter a connection sends, so a different one later stores nothing. To change it, remove this entry and pair again. While Home Assistant has several inverters, SunnyHome does not control any of them. The SolaX EV charger is sent by the first SunnyHome entry only.",
+        "data": {
+          "inverter_entry": "Inverter this connection reads"
+        }
+      },
       "inverter": {
         "title": "Inverter control",
         "description": "**Warning: this lets SunnyHome charge and discharge your home battery through the SolaX inverter.**\n\nWhen on, SunnyHome may put the inverter of your SolaX Modbus hub into a remote battery mode for 2 to 10 minutes at a time: charge or discharge at up to the power saved in your SunnyHome battery settings, hold the battery, or don't discharge it (it may still charge from solar). It uses only the hub's direct remote-control entities and only these modes. Nothing is sent unless SunnyHome has verified your inverter model, firmware and SolaX Modbus version, and you also allow inverter control in SunnyHome.\n\nHome Assistant ends the mode itself when SunnyHome stops renewing it, also after a restart. If Home Assistant stops reporting for 3 minutes while a mode runs, SunnyHome ends the mode through the SolaX cloud, as long as its SolaX cloud connection to your plant works and inverter control is allowed in SunnyHome. Otherwise the mode keeps running until Home Assistant is back and ends it; the inverter's own timeout did not end it in our test. If something else controls the inverter remotely (another energy manager or automation), SunnyHome does not start a mode, and it steps back when it sees another mode. Turning this off ends an active mode at once.",
@@ -99,13 +106,14 @@
       "number_unit": "The charging current number must be in amperes (A).",
       "number_range": "The charging current number needs a minimum and a maximum that allow some current between 6 A and 32 A.",
       "device_not_shareable": "This device cannot be shared as a whole: it belongs to an inverter, battery or energy integration, the Energy dashboard uses it, or it is gone.",
-      "too_many_device_entities": "The whole devices and the lists below have more than 512 entities or 512 sensors together."
+      "too_many_device_entities": "The whole devices and the lists below have more than 512 entities or 512 sensors together.",
+      "inverter_taken": "Another SunnyHome entry already reads this inverter. Pick another one."
     }
   },
   "issues": {
     "multiple_hubs": {
-      "title": "Several inverter integrations are not supported yet",
-      "description": "SunnyHome found more than one inverter integration entry (SolaX Modbus, GoodWe or Deye), so it sends no inverter data. Keep a single one to resume sending."
+      "title": "Pick the inverter for each SunnyHome entry",
+      "description": "This SunnyHome entry has no inverter to read: Home Assistant has several inverters (SolaX Modbus, GoodWe or Deye) and none is picked, or the picked one is gone. It sends no inverter data. Open the SunnyHome entry's options (Configure), pick the inverter it reads, and add one more SunnyHome entry for each further inverter."
     },
     "server_older": {
       "title": "SunnyHome does not take whole devices yet",
