@@ -136,7 +136,7 @@ GOODWE_KEYS = frozenset({
     "ppv", "ppv1", "ppv2", "ppv3", "active_power", "total_inverter_power", "pgrid", "pgrid2", "pgrid3",
     "backup_p1", "backup_p2", "backup_p3", "temperature", "work_mode",
     "pbattery1", "battery_soc", "battery_temperature",
-    "e_day", "e_total", "e_day_imp", "e_day_exp", "e_bat_charge_day", "e_bat_discharge_day", "e_load_day",
+    "e_day", "e_total", "meter_e_total_imp", "meter_e_total_exp", "e_bat_charge_day", "e_bat_discharge_day", "e_load_day",
 })
 
 # DEYE-003 (0.10.0): the ha-solarman deye_p3 / deye_hybrid sensor keys SunnyHome maps (davidrapan/ha-solarman ac1d88b,
