@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from collections.abc import Mapping
 from typing import Any
 
@@ -24,7 +25,7 @@ from homeassistant.helpers.selector import (
 )
 
 from . import (
-    binary_shareable, device_choices, heat_controllable, heat_shareable, inverter_entries, oldest_entry, other_wallbox_ids, payload, person_shareable, sensor_shareable,
+    binary_shareable, device_choices, heat_controllable, heat_shareable, inverter_entries, link_inverter, oldest_entry, other_wallbox_ids, payload, person_shareable, sensor_shareable,
     shareable, solax_charger, solax_remote, unshared_entries,
 )
 from .const import (
@@ -146,7 +147,8 @@ class SunnyHomeOptionsFlow(OptionsFlow):
                               CONF_DEVICES: devices, CONF_HUB: self.config_entry.options.get(CONF_HUB)}  # HA-027: kept while not asked
                 hubs = {hub.entry_id for _, hub in inverter_entries(self.hass)}
                 stale = self._data[CONF_HUB] and self._data[CONF_HUB] not in hubs  # review P2-3: a gone pick is asked again
-                if len(hubs) > 1 or stale:  # HA-027: which inverter this entry reads
+                # HA-028: also when the single inverter belongs to another entry (the step then says it is taken)
+                if len(hubs) > 1 or stale or (hubs and link_inverter(self.hass, self.config_entry) is None):  # HA-027: which inverter this entry reads
                     return await self.async_step_hub()
                 return await self._inverter_or_wallbox()
         excluded = unshared_entries(self.hass)  # DEYE-003: a Deye entry's entities are never offered
@@ -187,7 +189,8 @@ class SunnyHomeOptionsFlow(OptionsFlow):
         """HA-027: with several inverter entries, the one this SunnyHome entry reads (one per entry; another inverter needs another entry)."""
         errors: dict[str, str] = {}
         others = self.hass.config_entries.async_entries(DOMAIN)
-        taken = {entry.options.get(CONF_HUB) for entry in others if entry.entry_id != self.config_entry.entry_id} - {None}
+        # HA-028: an inverter another entry reads, by its pick or as the single inverter of the first entry without one
+        taken = {found[1].entry_id for entry in others if entry.entry_id != self.config_entry.entry_id and (found := link_inverter(self.hass, entry))}
         hubs = [hub for _, hub in inverter_entries(self.hass)]
         if user_input is not None:
             picked = user_input.get(CONF_HUB) or None
@@ -203,7 +206,8 @@ class SunnyHomeOptionsFlow(OptionsFlow):
 
     async def _inverter_or_wallbox(self) -> ConfigFlowResult:
         """BAT-008: the inverter-control step only with a single hub that has all four entities; else the option is off."""
-        if solax_remote(self.hass) is None:
+        reads = link_inverter(self.hass, SimpleNamespace(entry_id=self.config_entry.entry_id, options={**self.config_entry.options, **self._data}))
+        if solax_remote(self.hass) is None or reads is None:  # HA-028: never for an entry that will read no inverter
             self._data[CONF_INVERTER] = False
             return await self._wallbox_or_done()
         return await self.async_step_inverter()

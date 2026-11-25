@@ -122,6 +122,10 @@
     "devices_trimmed": {
       "title": "Některé entity celých zařízení se neposílají",
       "description": "Celá zařízení zaškrtnutá v nastavení mají víc entit, než SunnyHome přijme (512 entit a 512 senzorů nebo velikost jednoho hlášení), proto se posílají jen první podle ID entity. Odškrtněte některé zařízení nebo jeho entity sdílejte jednotlivě."
+    },
+    "wallbox_elsewhere": {
+      "title": "Wallbox SolaX ovládá jiná položka SunnyHome",
+      "description": "V této položce SunnyHome je zapnuté ovládání wallboxu, ale při více položkách SunnyHome posílá a ovládá EV nabíječku SolaX jen první běžící položka. Tato položka nedělá ani jedno. Zapněte ovládání wallboxu v možnostech první položky SunnyHome a tady ho vypněte."
     }
   }
 }

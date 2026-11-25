@@ -68,7 +68,7 @@ import voluptuous as vol
 
 from homeassistant import loader
 from homeassistant.components.light import brightness_supported
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import CONF_TOKEN, CONF_URL
 from homeassistant.core import Context, CoreState, HomeAssistant, callback
 from homeassistant.exceptions import ServiceNotFound
@@ -89,7 +89,7 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 SOLAX = "solax_modbus"
 GOODWE = "goodwe"  # GW-002
-INVERTERS = (SOLAX, GOODWE)  # the inverter integrations: exactly one entry across them is read, their entities are never shared
+INVERTERS = (SOLAX, GOODWE)  # the inverter integrations: each SunnyHome entry reads one entry across them (HA-027), their entities are never shared
 SOLARMAN = "solarman"  # DEYE-003: ha-solarman (Deye) and HA core's Solarman plugs share this domain; only Deye entries count
 ISSUE = "multiple_hubs"  # GW-002: several inverter integration entries (of one kind or mixed)
 SERIAL_KEYS = ("measured_power", "inverter_power")
@@ -105,6 +105,7 @@ CONTROL_DOMAINS = frozenset({*SHARED_DOMAINS, *payload.HEAT_DOMAINS, *payload.SE
 NOT_NUMERIC = frozenset({"enum", "timestamp", "date"})  # HA-021: sensor classes that are never a reading
 ISSUE_OLD = "server_older"  # HA-021: devices are ticked but SunnyHome does not take the 0.20.0 shape yet
 ISSUE_TRIM = "devices_trimmed"  # HA-021: whole devices pass the caps or the byte budget
+ISSUE_WALLBOX = "wallbox_elsewhere"  # HA-028: Wallbox control is on, but another SunnyHome entry posts and controls the charger
 RELOAD_S = 30  # HA-021: an entity registry change of a shared device reloads the entry after this quiet time
 BACKOFF_MIN, BACKOFF_MAX = 10, 300
 LEASE_TICK_S = 5  # how often due leases are checked
@@ -131,23 +132,38 @@ def inverter_entries(hass: HomeAssistant) -> list[tuple[str, ConfigEntry]]:
     return found + [(SOLARMAN, entry) for entry in deye_entries(hass)]
 
 
+def running_entries(hass: HomeAssistant, entry: ConfigEntry) -> list[ConfigEntry]:
+    """HA-028: the SunnyHome entries that count, in Home Assistant's order: all but disabled and failed ones (an entry reloading or retrying still
+    counts, so the charger and the single inverter never flap to another entry for a tick); this entry always counts, as passed (an options flow
+    passes its unsaved options)."""
+    failed = (ConfigEntryState.SETUP_ERROR, ConfigEntryState.MIGRATION_ERROR, ConfigEntryState.FAILED_UNLOAD)
+    running = [entry if other.entry_id == entry.entry_id else other for other in hass.config_entries.async_entries(DOMAIN)
+               if other.entry_id == entry.entry_id or (not other.disabled_by and other.state not in failed)]
+    return running if any(other.entry_id == entry.entry_id for other in running) else [*running, entry]  # one being removed is still itself
+
+
 def link_inverter(hass: HomeAssistant, entry: ConfigEntry) -> tuple[str, ConfigEntry] | None:
     """HA-027: the (domain, entry) of the inverter this SunnyHome entry reads: the one it picked (None once that is gone, never another one, since
-    SunnyHome fixes a link's integration and serial by its first stored post), else the single inverter entry, else None (several, none picked)."""
+    SunnyHome fixes a link's integration and serial by its first stored post; HA-028: None too when an earlier running entry picked the same one),
+    else the single inverter entry for the first running entry without a pick (HA-028), else None. One inverter is never read by two entries."""
     entries = inverter_entries(hass)
+    running = running_entries(hass, entry)
     picked = entry.options.get(CONF_HUB)
     if picked:
+        before = running[:next(n for n, other in enumerate(running) if other.entry_id == entry.entry_id)]
+        if any(other.options.get(CONF_HUB) == picked for other in before):  # HA-028: two options flows saved the same inverter
+            return None
         return next((found for found in entries if found[1].entry_id == picked), None)
-    # review P2-2: the single one only while no other SunnyHome entry picked it (one inverter is never on two plants)
-    taken = {other.options.get(CONF_HUB) for other in hass.config_entries.async_entries(DOMAIN) if other.entry_id != entry.entry_id}
-    return entries[0] if len(entries) == 1 and entries[0][1].entry_id not in taken else None
+    taken = {other.options.get(CONF_HUB) for other in running if other.entry_id != entry.entry_id}
+    unpicked = [other for other in running if not other.options.get(CONF_HUB)]
+    single = len(entries) == 1 and entries[0][1].entry_id not in taken and unpicked[:1] and unpicked[0].entry_id == entry.entry_id
+    return entries[0] if single else None
 
 
 def oldest_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """HA-027: whether this is the first SunnyHome entry; with one per inverter, only it posts the shared EV chargers, so a wallbox is never stored
-    on several plants."""
-    entries = hass.config_entries.async_entries(DOMAIN)
-    return not entries or entries[0].entry_id == entry.entry_id
+    """HA-027: whether this is the first running SunnyHome entry (HA-028: a disabled or failed one does not count); only it posts and controls the
+    shared EV chargers, so a wallbox is never stored on several plants."""
+    return running_entries(hass, entry)[0].entry_id == entry.entry_id
 
 
 def charger_hub(hass: HomeAssistant) -> ConfigEntry | None:
@@ -527,7 +543,7 @@ async def _reload(hass: HomeAssistant, entry: ConfigEntry) -> None:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     ir.async_delete_issue(hass, DOMAIN, ISSUE)  # HA-027: the global id of 0.28.0 and older
-    for key in (ISSUE, ISSUE_OLD, ISSUE_TRIM):  # HA-021: raised again by the next push if still true
+    for key in (ISSUE, ISSUE_OLD, ISSUE_TRIM, ISSUE_WALLBOX):  # HA-021: raised again by the next push if still true
         ir.async_delete_issue(hass, DOMAIN, f"{key}_{entry.entry_id}")
     return True
 
@@ -539,7 +555,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     await storage.Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.contract").async_remove()  # HA-021
     hass.data.get(DOMAIN, {}).get("sent", {}).pop(entry.entry_id, None)  # HA-021: the entities the last post sent
     store = storage.Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.inverter")
-    if await store.async_load() and (remote := solax_remote(hass)):
+    if await store.async_load() and link_inverter(hass, entry) and (remote := solax_remote(hass)):  # HA-028: only an inverter this entry reads
         try:
             await hass.services.async_call(
                 "select", "select_option", {"entity_id": remote.mode, "option": payload.SELECT_DISABLED}, blocking=True
@@ -645,18 +661,20 @@ class Pusher:
         """HA-021: the repair issues of whole devices: SunnyHome is older (the 0.19.0 shape is posted, so nothing of them is sent) and a device past
         the caps or the byte budget (the first ones by entity id are sent)."""
         devices = bool(self.entry.options.get(CONF_DEVICES))
-        for key, raised in ((ISSUE_OLD, devices and self.answered and not self.v2), (ISSUE_TRIM, devices and self.trimmed)):
+        elsewhere = bool(self.entry.options.get(CONF_WALLBOX)) and not oldest_entry(self.hass, self.entry) and charger_hub(self.hass) is not None
+        for key, raised in ((ISSUE_OLD, devices and self.answered and not self.v2), (ISSUE_TRIM, devices and self.trimmed), (ISSUE_WALLBOX, elsewhere)):
             if raised:
                 ir.async_create_issue(self.hass, DOMAIN, f"{key}_{self.entry.entry_id}", is_fixable=False, severity=ir.IssueSeverity.WARNING, translation_key=key)
             else:
                 ir.async_delete_issue(self.hass, DOMAIN, f"{key}_{self.entry.entry_id}")
 
     def collect(self, v2: bool = False) -> dict:
-        """Body with the shared devices; "solax" is null unless exactly one inverter integration entry exists (GW-002: a goodwe
+        """Body with the shared devices; "solax" is null unless this entry reads an inverter (HA-027: link_inverter; GW-002: a goodwe
         entry posts "inverter" in its place; DEYE-003: so does a Deye entry with a valid serial, else "solax" stays null).
         HA-021: v2 is the 0.20.0 shape: the whole devices, the new keys and the 512 caps (64/32 after a 413)."""
         picked = link_inverter(self.hass, self.entry)
-        # HA-027: per entry, raised while several inverter entries exist and this one has no valid pick, or its pick is gone (review P2-3)
+        # HA-027: per entry, raised while several inverter entries exist and this one has no valid pick, or its pick is gone (HA-028: an entry
+        # without a pick whose single inverter another entry reads is deliberate, no issue)
         if picked is None and (len(inverter_entries(self.hass)) > 1 or self.entry.options.get(CONF_HUB)):
             ir.async_create_issue(
                 self.hass, DOMAIN, f"{ISSUE}_{self.entry.entry_id}", is_fixable=False, severity=ir.IssueSeverity.WARNING, translation_key=ISSUE
@@ -1549,7 +1567,7 @@ class CommandRunner:
         headers = {**self.headers, "X-SunnyHome-Leases": "1"} if path == "claim" else self.headers
         if path == "claim":  # RA-004: from 0.6.0 SunnyHome also sends no_discharge (mode 7); HA-014: from 0.16.0 heat commands; WALLBOX-005: from 0.17.0 set_current; so on every claim
             headers["X-SunnyHome-Component"] = VERSION
-        if path == "claim" and self.entry.options.get(CONF_INVERTER):  # BAT-008: inverter commands only while the option is on
+        if path == "claim" and self.entry.options.get(CONF_INVERTER) and link_inverter(self.hass, self.entry):  # HA-028: not without an inverter  # BAT-008: inverter commands only while the option is on
             headers["X-SunnyHome-Inverter"] = "1"
         if path == "claim" and (self.entry.options.get(CONF_WALLBOX) and oldest_entry(self.hass, self.entry)  # HA-027 review P2-4
                                 or self.entry.options.get(CONF_OTHER_WALLBOX)):  # EV-004, WALLBOX-005: wallbox commands only while an option is on

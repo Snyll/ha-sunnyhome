@@ -122,6 +122,10 @@
     "devices_trimmed": {
       "title": "Some entities of whole devices are not sent",
       "description": "The whole devices ticked in the options have more entities than SunnyHome takes (512 entities and 512 sensors, or the size of one report), so only the first ones by entity id are sent. Untick a device or share its entities one by one."
+    },
+    "wallbox_elsewhere": {
+      "title": "SolaX wallbox is controlled by another SunnyHome entry",
+      "description": "Wallbox control is on in this SunnyHome entry, but with several SunnyHome entries only the first running one sends and controls the SolaX EV charger. This entry does neither. Turn Wallbox control on in the first SunnyHome entry's options and off here."
     }
   }
 }
