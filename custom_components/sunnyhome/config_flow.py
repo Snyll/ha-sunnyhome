@@ -118,8 +118,20 @@ class SunnyHomeOptionsFlow(OptionsFlow):
     """Choose the switches and lights shared with SunnyHome, the subset it may control, the sensors it may read and (HA-012) the binary sensors
     and people it may see and (HA-013) the heat pumps and boilers it may read; none by default. HA-021: whole devices, shared with their control (D2)."""
 
+    _asked = False  # HA-029: whether the inverter step ran in this flow, and what it picked
+    _hub: str | None = None
+
+    def _hub_needed(self) -> bool:
+        """HA-027: whether this entry must pick its inverter: several inverters, a gone pick (review P2-3), or HA-028 the single inverter belongs to
+        another entry (the step then says it is taken)."""
+        hubs = {hub.entry_id for _, hub in inverter_entries(self.hass)}
+        picked = self.config_entry.options.get(CONF_HUB)
+        return len(hubs) > 1 or bool(picked and picked not in hubs) or bool(hubs and link_inverter(self.hass, self.config_entry) is None)
+
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         errors: dict[str, str] = {}
+        if user_input is None and not self._asked and self._hub_needed():  # HA-029: the inverter comes first, where the repair issue sends the user
+            return await self.async_step_hub()
         if user_input is not None:
             chosen = user_input.get(CONF_ENTITIES, [])
             control = user_input.get(CONF_CONTROL, [])
@@ -144,12 +156,7 @@ class SunnyHomeOptionsFlow(OptionsFlow):
                 errors[CONF_DEVICES] = "too_many_device_entities"
             else:
                 self._data = {CONF_ENTITIES: chosen, CONF_CONTROL: control, CONF_SENSORS: sensors, CONF_BINARY: binary, CONF_PEOPLE: people, CONF_HEAT: heat,
-                              CONF_DEVICES: devices, CONF_HUB: self.config_entry.options.get(CONF_HUB)}  # HA-027: kept while not asked
-                hubs = {hub.entry_id for _, hub in inverter_entries(self.hass)}
-                stale = self._data[CONF_HUB] and self._data[CONF_HUB] not in hubs  # review P2-3: a gone pick is asked again
-                # HA-028: also when the single inverter belongs to another entry (the step then says it is taken)
-                if len(hubs) > 1 or stale or (hubs and link_inverter(self.hass, self.config_entry) is None):  # HA-027: which inverter this entry reads
-                    return await self.async_step_hub()
+                              CONF_DEVICES: devices, CONF_HUB: self._hub if self._asked else self.config_entry.options.get(CONF_HUB)}  # HA-027: kept while not asked
                 return await self._inverter_or_wallbox()
         excluded = unshared_entries(self.hass)  # DEYE-003: a Deye entry's entities are never offered
         options = self._options(lambda ent: shareable(ent, excluded))
@@ -197,8 +204,8 @@ class SunnyHomeOptionsFlow(OptionsFlow):
             if picked in taken:
                 errors[CONF_HUB] = "inverter_taken"
             else:
-                self._data[CONF_HUB] = picked
-                return await self._inverter_or_wallbox()
+                self._hub, self._asked = picked, True
+                return await self.async_step_init()  # HA-029: then the shared devices
         options = [SelectOptionDict(value=hub.entry_id, label=f"{hub.title} ({hub.domain})") for hub in hubs]
         schema = vol.Schema({vol.Optional(CONF_HUB): SelectSelector(SelectSelectorConfig(options=options, mode=SelectSelectorMode.LIST))})
         current = {CONF_HUB: picked} if (picked := (user_input or self.config_entry.options).get(CONF_HUB)) in {o["value"] for o in options} else {}

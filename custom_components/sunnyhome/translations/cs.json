@@ -113,7 +113,7 @@
   "issues": {
     "multiple_hubs": {
       "title": "Vyberte střídač pro každou položku SunnyHome",
-      "description": "Tato položka SunnyHome nemá střídač ke čtení: Home Assistant má několik střídačů (SolaX Modbus, GoodWe nebo Deye) a žádný není vybraný, nebo vybraný zmizel. Neposílá data ze střídače. Otevřete možnosti položky SunnyHome (Nastavit), vyberte střídač, který čte, a pro každý další střídač přidejte další položku SunnyHome."
+      "description": "Tato položka SunnyHome nemá střídač ke čtení: Home Assistant má několik střídačů (SolaX Modbus, GoodWe nebo Deye) a žádný není vybraný, nebo vybraný zmizel. Neposílá data ze střídače. Otevřete možnosti této položky SunnyHome (Nastavit): hned první krok vybírá střídač, který čte. Pro každý další střídač přidejte další položku SunnyHome (Přidat položku, s novým kódem ze SunnyHome)."
     },
     "server_older": {
       "title": "SunnyHome zatím nepřijímá celá zařízení",

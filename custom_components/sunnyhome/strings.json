@@ -113,7 +113,7 @@
   "issues": {
     "multiple_hubs": {
       "title": "Pick the inverter for each SunnyHome entry",
-      "description": "This SunnyHome entry has no inverter to read: Home Assistant has several inverters (SolaX Modbus, GoodWe or Deye) and none is picked, or the picked one is gone. It sends no inverter data. Open the SunnyHome entry's options (Configure), pick the inverter it reads, and add one more SunnyHome entry for each further inverter."
+      "description": "This SunnyHome entry has no inverter to read: Home Assistant has several inverters (SolaX Modbus, GoodWe or Deye) and none is picked, or the picked one is gone. It sends no inverter data. Open this SunnyHome entry's options (Configure): the first step picks the inverter it reads. Add one more SunnyHome entry (Add entry, with a new code from SunnyHome) for each further inverter."
     },
     "server_older": {
       "title": "SunnyHome does not take whole devices yet",
