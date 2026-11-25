@@ -25,7 +25,7 @@ from homeassistant.helpers.selector import (
 )
 
 from . import (
-    binary_shareable, device_choices, heat_controllable, heat_shareable, inverter_entries, link_inverter, oldest_entry, other_wallbox_ids, payload, person_shareable, sensor_shareable,
+    binary_shareable, device_choices, heat_controllable, heat_shareable, inverter_entries, link_inverter, oldest_entry, TITLE, other_wallbox_ids, payload, person_shareable, sensor_shareable,
     shareable, solax_charger, solax_remote, unshared_entries,
 )
 from .const import (
@@ -68,7 +68,7 @@ class SunnyHomeConfigFlow(ConfigFlow, domain=DOMAIN):
                 await self.async_set_unique_id(link_id)
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(
-                    title="SunnyHome", data={CONF_URL: url, CONF_LINK_ID: link_id, CONF_TOKEN: token}
+                    title=TITLE, data={CONF_URL: url, CONF_LINK_ID: link_id, CONF_TOKEN: token}
                 )
         return self.async_show_form(
             step_id="user", data_schema=self.add_suggested_values_to_schema(USER_SCHEMA, user_input), errors=errors

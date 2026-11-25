@@ -160,6 +160,18 @@ def link_inverter(hass: HomeAssistant, entry: ConfigEntry) -> tuple[str, ConfigE
     return entries[0] if single else None
 
 
+TITLE = "SunnyHome"  # the entry title the pairing gives (config_flow)
+
+
+def name_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """HA-030: an entry with a picked inverter is titled "SunnyHome – <inverter entry title>", so several SunnyHome entries can be told apart;
+    a title the user gave is never overwritten, and an entry without a pick keeps its title."""
+    found = link_inverter(hass, entry) if entry.options.get(CONF_HUB) else None
+    title = f"{TITLE} – {found[1].title}" if found else None
+    if title and entry.title != title and (entry.title == TITLE or entry.title.startswith(f"{TITLE} – ")):
+        hass.config_entries.async_update_entry(entry, title=title)
+
+
 def oldest_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """HA-027: whether this is the first running SunnyHome entry (HA-028: a disabled or failed one does not count); only it posts and controls the
     shared EV chargers, so a wallbox is never stored on several plants."""
@@ -502,6 +514,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     pusher.history = HistoryRun(hass, entry, pusher)  # PAR-019: one run per start, once SunnyHome's answer asks for it
     await pusher.load()  # HA-021: the stored contract, so a restart posts the 0.20.0 shape at once
     entry.async_on_unload(async_track_time_interval(hass, pusher.tick, timedelta(seconds=10), name="SunnyHome push"))
+    name_entry(hass, entry)  # HA-030: before the update listener, so the new title causes no reload (an options save reloads into here)
     entry.async_on_unload(entry.add_update_listener(_reload))
     runner = CommandRunner(hass, entry)
     # AUTO-004: the leases are kept with or without a control list (an empty list drops them) and whatever the token's state,
