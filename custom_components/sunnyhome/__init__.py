@@ -80,10 +80,10 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event, async_track_time_interval
 from homeassistant.util import dt as dt_util
 
-from . import payload
+from . import payload, settings_runner
 from .const import (
     CONF_BINARY, CONF_CONTROL, CONF_DEVICES, CONF_ENTITIES, CONF_HEAT, CONF_HUB, CONF_INVERTER, CONF_OTHER_WALLBOX, CONF_OW_CURRENT, CONF_OW_ENERGY,
-    CONF_OW_POWER, CONF_OW_STATUS, CONF_OW_SWITCH, CONF_PEOPLE, CONF_SENSORS, CONF_WALLBOX, DOMAIN, VERSION,
+    CONF_OW_POWER, CONF_OW_STATUS, CONF_OW_SWITCH, CONF_PEOPLE, CONF_SENSORS, CONF_SETTINGS_CONTROL, CONF_WALLBOX, DOMAIN, VERSION,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -235,6 +235,43 @@ def deye_entries(hass: HomeAssistant) -> list[ConfigEntry]:
     device's manufacturer starts with "Deye" (ha-solarman sets "Deye"; core Solarman plugs and meters "SOLARMAN")."""
     return [entry for entry in hass.config_entries.async_entries(SOLARMAN)
             if payload.deye_manufacturer(getattr(inverter_device(hass, entry), "manufacturer", None))]
+
+
+def settings_inverter(hass: HomeAssistant, entry: ConfigEntry) -> tuple | None:
+    """DEYE-013: (domain, inverter entry, serial, device id) of the inverter this SunnyHome entry reads (HA-027: link_inverter, so one inverter
+    is controlled by one entry only) when its integration has a profile with a settingsControl binding; the serial is the one the reader last
+    posted (None until then: nothing is armed before it is known)."""
+    found = link_inverter(hass, entry)
+    if found is None or settings_runner.binding_of(found[0]) is None:
+        return None
+    domain, hub = found
+    device = inverter_device(hass, hub)
+    serial = hass.data.get(DOMAIN, {}).get("inverter_serials", {}).get(hub.entry_id)
+    return domain, hub, serial, device.id if device else None
+
+
+def settings_hub(hass: HomeAssistant, hub_id: str) -> tuple | None:
+    """DEYE-036 (C1, C8): (domain, inverter entry, device id) of the inverter entry a settings mirror recorded, whichever SunnyHome entry reads it
+    now, while it is there and its integration has a settingsControl binding; None otherwise."""
+    found = next(((domain, hub) for domain, hub in inverter_entries(hass) if hub.entry_id == hub_id), None)
+    if found is None or settings_runner.binding_of(found[0]) is None:
+        return None
+    device = inverter_device(hass, found[1])
+    return found[0], found[1], device.id if device else None
+
+
+def settings_runner_for(hass: HomeAssistant, entry: ConfigEntry) -> settings_runner.SettingsRunner:
+    """DEYE-013: the settings runner of a SunnyHome entry (C2: a mirror's owner counts while it is a running entry, HA-028's one rule)."""
+    return settings_runner.SettingsRunner(hass, entry, lambda: settings_inverter(hass, entry), lambda: settings_timings(hass, entry),
+                                          lambda hub_id: settings_hub(hass, hub_id),
+                                          lambda owner: any(other.entry_id == owner for other in running_entries(hass, entry)))
+
+
+def settings_timings(hass: HomeAssistant, entry: ConfigEntry) -> dict | None:
+    """DEYE-013: the settings controller's timings from this entry's last states answer (None: an older SunnyHome, nothing is armed).
+    DEYE-036 (C3): per entry, as each link's answer carries its own clockOffsetMs."""
+    timings = hass.data.get(DOMAIN, {}).get("settings_timings", {}).get(entry.entry_id) if isinstance(hass.data, dict) else None
+    return timings if isinstance(timings, dict) else None
 
 
 def unshared_entries(hass: HomeAssistant) -> frozenset[str]:
@@ -523,7 +560,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # BAT-008: the inverter option alone also claims; EV-004: so does the Wallbox control option; WALLBOX-005: and the Other wallbox control option;
     # HA-021: and any whole device (its control is shared with it, D2)
     if entry.options.get(CONF_CONTROL) or entry.options.get(CONF_INVERTER) or entry.options.get(CONF_WALLBOX) or entry.options.get(CONF_OTHER_WALLBOX) \
-            or entry.options.get(CONF_DEVICES):
+            or entry.options.get(CONF_DEVICES) or runner.settings_claims():  # DEYE-013: a settings-controlled inverter claims too (its restores)
         # An entry background task: HA cancels it, and the commands it started, on unload or reload.
         entry.async_create_background_task(hass, runner.run(), "SunnyHome commands")
     if entry.options.get(CONF_DEVICES):  # HA-021: a new, changed or removed entity of a shared device reloads the entry (debounced), so the watcher follows
@@ -576,6 +613,14 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
         except Exception as err:  # noqa: BLE001 - best effort; the inverter's own timeout is the backstop
             _LOGGER.debug("Inverter exit at removal failed: %s", type(err).__name__)
     await store.async_remove()
+    # DEYE-013: a held settings lease gets one verified restore try, then a repair issue and a notification with the owner's values (the store stays)
+    try:
+        runner = settings_runner_for(hass, entry)
+        await runner.load()
+        await settings_runner.remove(hass, entry, runner)
+    except Exception as err:  # noqa: BLE001 - best effort; the issue says what is left
+        _LOGGER.debug("Settings restore at removal failed: %s", type(err).__name__)
+    hass.data.get(DOMAIN, {}).get("settings_timings", {}).pop(entry.entry_id, None)
     # EV-004: a stored wallbox lease gets a best-effort write of its normal mode first, only while the charger still shows what the lease
     # set (post review P3-4: never over a hand change)
     store = storage.Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.wallbox")
@@ -702,6 +747,8 @@ class Pusher:
             serial, readings, info = self.solax(hub)
         else:
             serial, readings, info = (*(self.deye(hub) if domain == SOLARMAN else self.goodwe(hub)), None)
+        if hub is not None:  # DEYE-036 (C7): every inverter integration's, so a binding of any brand finds it
+            self.hass.data.setdefault(DOMAIN, {}).setdefault("inverter_serials", {})[hub.entry_id] = serial  # DEYE-013: the settings controller's serial
         # SMB-004: the remote report for a SolaX plugin's hub only; SMB-007: settings also for a Growatt, Solis or Sofar hub (read only)
         profile = payload.settings_integration(info["plugin"]) if solax else None
         solax = solax and payload.solax_plugin(info["plugin"])
@@ -716,6 +763,13 @@ class Pusher:
             self.sensors(v2, devices, limits[1]), self.remote(readings) if solax else None, self.settings(hub, profile) if profile else None, domain, info,
             self.wallbox(), None if self.wallboxes_off else self.other_wallboxes(), v2, limits,
         )
+        if body.get("inverter") is not None and settings_timings(self.hass, self.entry) is not None and (b := settings_runner.binding_of(domain)) is not None:
+            # DEYE-013: only to a SunnyHome whose answer carried "settingsControl" (an older one refuses unknown inverter keys and the whole post)
+            if (states := self.setting_states(hub, b)) is not None:
+                body["inverter"]["settings"] = states
+            if (control := self.hass.data.get(DOMAIN, {}).get("settings_reports", {}).get(self.entry.entry_id)) is not None \
+                    and (block := control()) is not None:
+                body["inverter"]["settingsControl"] = block
         rank = {ent.entity_id: -1 if ent.entity_id in explicit else n for n, ent in enumerate(devices)}  # a ticked entity is never trimmed before a device's
         self.order = sorted((item["entityId"] for key in ("entities", "sensors") for item in body.get(key) or ()), key=lambda eid: rank.get(eid, -1))
         return body
@@ -956,6 +1010,16 @@ class Pusher:
                 readings.append((key, state.attributes.get("unit_of_measurement"), state.state, state.last_reported))
         return serial, readings
 
+    def setting_states(self, entry: ConfigEntry, b) -> dict | None:
+        """DEYE-013 (TASK-1054 criterion 2): the profile's setting entities' states, by the profile's entity names, under the profile's integration."""
+        by_id = {ent.unique_id: ent.entity_id for ent in er.async_entries_for_config_entry(er.async_get(self.hass), entry.entry_id) if not ent.disabled}
+        states = {}
+        for key, mapping in b.settings.items():
+            entity = by_id.get(b.unique_id(entry.entry_id, key))
+            if entity and (state := self.hass.states.get(entity)) is not None:
+                states[mapping["entity"]] = state.state
+        return payload.settings(b.id.split(".", 1)[1], states)
+
     def deye(self, entry: ConfigEntry, ids: dict | None = None) -> tuple[str | None, list | None]:
         """DEYE-003: (serial, readings) of the Deye sensors of the single Deye solarman entry, or (None, None) (then "solax": null)
         while the Device sensor or its Serial Number attribute is missing or invalid: the registry serial_number falls back to the
@@ -996,6 +1060,8 @@ class Pusher:
                         answer = None
                     self.answered, self.contract, self.unconfirmed = True, isinstance(answer, dict) and answer.get("contract") == 2, False
                     await self.remember(self.contract)
+                    timings = answer.get("settingsControl") if isinstance(answer, dict) else None  # DEYE-013: the core's timings, or none
+                    self.hass.data.setdefault(DOMAIN, {}).setdefault("settings_timings", {})[self.entry.entry_id] = timings if settings_runner.valid_timings(timings) else None
                     if isinstance(answer, dict) and answer.get("history") == 1 and self.history is not None:  # PAR-019: SunnyHome takes the history
                         self.history.start()
                     if not self.contract:  # an old (rolled back) server explains the refusals: a re-deploy's contract switches back without a reload
@@ -1016,6 +1082,10 @@ class Pusher:
             self.stopped = True
             _LOGGER.warning("SunnyHome refused the token; pair again with a new code")
             self.entry.async_start_reauth(self.hass)
+        elif status == 422 and any(key in (body.get("inverter") or {}) for key in ("settings", "settingsControl")):
+            # DEYE-013: checked first: a rolled-back SunnyHome refuses the settings keys; they wait for the next "settingsControl" answer, nothing else stops
+            self.hass.data.setdefault(DOMAIN, {}).setdefault("settings_timings", {})[self.entry.entry_id] = None  # C3: only this entry's
+            _LOGGER.warning("SunnyHome rejected a post carrying inverter settings (HTTP 422), probably because its server is older; not sending them until it announces them")
         elif v2 and self.unconfirmed and status is not None and 400 <= status < 500 and status not in (404, 429):
             # 0.27.1: /states never answers 404, so a 404 is a proxy's page during a deploy, not a refused contract
             # HA-021: the stored contract was refused before a 200 confirmed it (a rolled back server: 422, 413, 415, 400 ...; 401 is the token's and
@@ -1218,6 +1288,9 @@ class CommandRunner:
             shared["locks"].setdefault(OTHER_WALLBOX_LOCK, asyncio.Lock()), lambda: generic_config(hass, entry),
             lambda: bool(entry.options.get(CONF_OTHER_WALLBOX)), self.select_state, self.dispatch, self.save_generic, shared.setdefault("echoes", {}),
         )
+        # DEYE-013: the settings controller of a settings-controlled inverter entry, its mirror in one fixed-key store
+        self.settings = settings_runner_for(hass, entry)
+        shared.setdefault("settings_reports", {})[entry.entry_id] = self.settings.report
         self.env = payload.Env(
             shared["locks"], shared.setdefault("inflight", {}),
             lambda entity_id: entity_id in controllable(hass, entry), self.seen, self.dispatch,
@@ -1234,6 +1307,9 @@ class CommandRunner:
         self.entry.async_on_unload(async_track_state_change_event(self.hass, watched(self.hass, self.entry),  # HA-021: with the whole devices' controllable entities
                                                                   callback(lambda event: self.state_changed(event))))
         self.entry.async_create_background_task(self.hass, self.send_reports(), "SunnyHome lease reports")
+        # DEYE-013: the settings mirror survives unload, reload (which writes nothing) and restart; its tick ends a lease, checks a held one and lets go
+        await self.settings.load()
+        self.entry.async_on_unload(async_track_time_interval(self.hass, self.settings_tick, timedelta(seconds=LEASE_TICK_S), name="SunnyHome settings lease"))
         # BAT-008: the inverter lease survives unload, reload and restart; the tick also ends it when the option was turned off.
         self.inverter.load(await self.inverter_store.async_load())
         self.entry.async_on_unload(lambda: setattr(self.inverter, "unloaded", True))
@@ -1252,6 +1328,24 @@ class CommandRunner:
         self.entry.async_on_unload(async_track_time_interval(
             self.hass, self.generic.tick, timedelta(seconds=LEASE_TICK_S), name="SunnyHome other wallbox lease"
         ))
+
+    async def settings_tick(self, _now: datetime | None = None) -> None:
+        async with self.hass.data[DOMAIN]["locks"].setdefault("settings", asyncio.Lock()):
+            await self.settings.tick()
+
+    def settings_claims(self) -> bool:
+        """DEYE-013, DEYE-030 (Low): a settings-controlled inverter claims while its option is on, or while a stored mirror of this entry still
+        owes a restore (its ops must reach it with the option off); with neither, nothing is claimed for it."""
+        return settings_inverter(self.hass, self.entry) is not None and (bool(self.entry.options.get(CONF_SETTINGS_CONTROL)) or self.settings.holds())
+
+    async def execute_settings(self, cid: str, item: dict, sent: float) -> None:
+        """DEYE-013: one settings op under the settings lock; its result carries assumedState null, like an inverter command."""
+        async with self.hass.data[DOMAIN]["locks"].setdefault("settings", asyncio.Lock()):
+            if time.monotonic() >= payload.deadline(sent, item["ttlMs"]):
+                outcome, reason = "failed", "expired_on_arrival"
+            else:
+                outcome, reason = await self.settings.execute(item)
+        await self.result({"commandId": cid, "outcome": outcome, "reason": reason, "assumedState": None}, time.monotonic())
 
     async def save_inverter(self, data: dict | None) -> None:
         if data is None:
@@ -1472,6 +1566,9 @@ class CommandRunner:
             if status == 200 and isinstance(commands, list):
                 delay = 0
                 for item in commands:
+                    if (cid := settings_runner.settings_op(item, settings_inverter(self.hass, self.entry) is not None)) is not None:  # DEYE-013
+                        self.entry.async_create_background_task(self.hass, self.execute_settings(cid, item, sent), "SunnyHome settings op")
+                        continue
                     inverter = isinstance(item, dict) and "inverter" in item  # BAT-008
                     generic = isinstance(item, dict) and item.get("wallbox") == "set_current"  # WALLBOX-005
                     wallbox = isinstance(item, dict) and "wallbox" in item and not generic  # EV-004
@@ -1505,6 +1602,10 @@ class CommandRunner:
     async def execute_inverter(self, cid: str, cmd: payload.InverterCommand | None, sent: float) -> None:
         """BAT-008: one inverter command; its result carries assumedState null."""
         outcome, reason = ("failed", "invalid_command") if cmd is None else await self.inverter.execute(cmd, sent)
+        if outcome == "done" and cmd.op == "exit":  # DEYE-036 (C1): a settings mirror left on the inverter picked before is let go too
+            async with self.hass.data[DOMAIN]["locks"].setdefault("settings", asyncio.Lock()):
+                if await self.settings.let_go_left():
+                    outcome, reason = "unknown", None  # never done while one of this entry's mirrors holds SunnyHome's values
         await self.result({"commandId": cid, "outcome": outcome, "reason": reason, "assumedState": None}, time.monotonic())
 
     async def execute_reset(self, cid: str, cmd: payload.InverterReset | None, sent: float) -> None:
@@ -1580,7 +1681,7 @@ class CommandRunner:
         headers = {**self.headers, "X-SunnyHome-Leases": "1"} if path == "claim" else self.headers
         if path == "claim":  # RA-004: from 0.6.0 SunnyHome also sends no_discharge (mode 7); HA-014: from 0.16.0 heat commands; WALLBOX-005: from 0.17.0 set_current; so on every claim
             headers["X-SunnyHome-Component"] = VERSION
-        if path == "claim" and self.entry.options.get(CONF_INVERTER) and link_inverter(self.hass, self.entry):  # HA-028: not without an inverter  # BAT-008: inverter commands only while the option is on
+        if path == "claim" and (self.entry.options.get(CONF_INVERTER) and link_inverter(self.hass, self.entry) or self.settings_claims()):  # BAT-008: inverter commands only while the option is on; HA-028: not without this entry's inverter; DEYE-013: or this entry's settings-controlled inverter (its restores must reach it with the option off)
             headers["X-SunnyHome-Inverter"] = "1"
         if path == "claim" and (self.entry.options.get(CONF_WALLBOX) and oldest_entry(self.hass, self.entry)  # HA-027 review P2-4
                                 or self.entry.options.get(CONF_OTHER_WALLBOX)):  # EV-004, WALLBOX-005: wallbox commands only while an option is on

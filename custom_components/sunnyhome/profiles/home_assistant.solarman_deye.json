@@ -1,0 +1,698 @@
+{
+  "contract": "inverter-settings-v1",
+  "profile": "home_assistant.solarman_deye",
+  "source": "home_assistant",
+  "row": "solarman",
+  "vendor": "deye",
+  "cardNeedsValues": true,
+  "note": "DEYE-022 (docs/28-deye-inverter-control.md sections 3 and 5.2): a Deye hybrid through ha-solarman (davidrapan/ha-solarman ac1d88b, deye_p3.yaml and deye_hybrid.yaml), read only. entity: <domain>.<ha-solarman key> (the unique_id <entry id>_<key>_<platform> without entry id and platform; one name for both definitions); values: option -> catalog code. unverified until DEYE-001 (the tester snapshot). row: the Home Assistant inverter row (HomeAssistantInverterProfile id) whose posts carry these settings (DEYE-013: the component posts them under the integration solarman_deye); vendor deye turns the Settings card (PAR-010) on once this source stored a value for the plant (cardNeedsValues, DEYE-030 P2: no empty card before component 0.30.0 posts them, none on a Deye Cloud plant). readbackData: the read service fields, {device} the inverter HA device id and {address} the register (ha-solarman ac1d88b services.py: device, address 0-65535, count 0-125, answer {address: u16}); uniqueId: the unique id of a setting entity ({entry} the ha-solarman entry id, {platform} the entity domain). settingsControl is the write binding of the family file, for unit 4: per definition the register of every role (address, scale per LP3/HP3 variant, range in catalog units, raw: register value -> catalog code, rawBit0: the code of any other value with bit 0 set, encoding hhmm: HH*100+MM), definitions: how the Device register picks the definition and variant (the variant is max(detected, the entry option)), neverTouched: addresses no binding may name, readback: the fresh read service, clock and backupLoad: read only. Nothing is written by this unit.",
+  "staleSeconds": 300,
+  "settings": {
+    "work_mode": {
+      "entity": "select.work_mode",
+      "values": {
+        "Export First": "feed_in",
+        "Zero Export To Load": "zero_export_load",
+        "Zero Export To CT": "zero_export_ct"
+      },
+      "unverified": true
+    },
+    "export_limit": {
+      "entity": "number.export_surplus_power",
+      "unverified": true
+    },
+    "solar_sell": {
+      "entity": "switch.export_surplus",
+      "unverified": true
+    },
+    "battery_charge_max_current": {
+      "entity": "number.battery_max_charging_current",
+      "unverified": true
+    },
+    "battery_discharge_max_current": {
+      "entity": "number.battery_max_discharging_current",
+      "unverified": true
+    },
+    "grid_charge": {
+      "entity": "switch.battery_grid_charging",
+      "unverified": true
+    },
+    "grid_charge_current": {
+      "entity": "number.battery_grid_charging_current",
+      "unverified": true
+    },
+    "tou_days": {
+      "entity": "select.time_of_use",
+      "values": {
+        "Disabled": "disabled",
+        "Monday": "monday",
+        "Tuesday": "tuesday",
+        "Wednesday": "wednesday",
+        "Thursday": "thursday",
+        "Friday": "friday",
+        "Saturday": "saturday",
+        "Sunday": "sunday",
+        "Weekdays": "weekdays",
+        "Weekend": "weekend",
+        "Week -Monday": "week_except_monday",
+        "Week -Tuesday": "week_except_tuesday",
+        "Week -Wednesday": "week_except_wednesday",
+        "Week -Thursday": "week_except_thursday",
+        "Week -Friday": "week_except_friday",
+        "Week -Saturday": "week_except_saturday",
+        "Week -Sunday": "week_except_sunday",
+        "Week": "week",
+        "Enabled": "enabled"
+      },
+      "unverified": true
+    },
+    "tou_program1_start": {
+      "entity": "time.program_1_time",
+      "unverified": true
+    },
+    "tou_program1_soc": {
+      "entity": "number.program_1_soc",
+      "unverified": true
+    },
+    "tou_program1_charge": {
+      "entity": "select.program_1_charging",
+      "values": {
+        "Disabled": "disabled",
+        "Grid": "grid",
+        "Generator": "generator",
+        "Both": "both"
+      },
+      "unverified": true
+    },
+    "tou_program1_power": {
+      "entity": "number.program_1_power",
+      "unverified": true
+    },
+    "tou_program2_start": {
+      "entity": "time.program_2_time",
+      "unverified": true
+    },
+    "tou_program2_soc": {
+      "entity": "number.program_2_soc",
+      "unverified": true
+    },
+    "tou_program2_charge": {
+      "entity": "select.program_2_charging",
+      "values": {
+        "Disabled": "disabled",
+        "Grid": "grid",
+        "Generator": "generator",
+        "Both": "both"
+      },
+      "unverified": true
+    },
+    "tou_program2_power": {
+      "entity": "number.program_2_power",
+      "unverified": true
+    },
+    "tou_program3_start": {
+      "entity": "time.program_3_time",
+      "unverified": true
+    },
+    "tou_program3_soc": {
+      "entity": "number.program_3_soc",
+      "unverified": true
+    },
+    "tou_program3_charge": {
+      "entity": "select.program_3_charging",
+      "values": {
+        "Disabled": "disabled",
+        "Grid": "grid",
+        "Generator": "generator",
+        "Both": "both"
+      },
+      "unverified": true
+    },
+    "tou_program3_power": {
+      "entity": "number.program_3_power",
+      "unverified": true
+    },
+    "tou_program4_start": {
+      "entity": "time.program_4_time",
+      "unverified": true
+    },
+    "tou_program4_soc": {
+      "entity": "number.program_4_soc",
+      "unverified": true
+    },
+    "tou_program4_charge": {
+      "entity": "select.program_4_charging",
+      "values": {
+        "Disabled": "disabled",
+        "Grid": "grid",
+        "Generator": "generator",
+        "Both": "both"
+      },
+      "unverified": true
+    },
+    "tou_program4_power": {
+      "entity": "number.program_4_power",
+      "unverified": true
+    },
+    "tou_program5_start": {
+      "entity": "time.program_5_time",
+      "unverified": true
+    },
+    "tou_program5_soc": {
+      "entity": "number.program_5_soc",
+      "unverified": true
+    },
+    "tou_program5_charge": {
+      "entity": "select.program_5_charging",
+      "values": {
+        "Disabled": "disabled",
+        "Grid": "grid",
+        "Generator": "generator",
+        "Both": "both"
+      },
+      "unverified": true
+    },
+    "tou_program5_power": {
+      "entity": "number.program_5_power",
+      "unverified": true
+    },
+    "tou_program6_start": {
+      "entity": "time.program_6_time",
+      "unverified": true
+    },
+    "tou_program6_soc": {
+      "entity": "number.program_6_soc",
+      "unverified": true
+    },
+    "tou_program6_charge": {
+      "entity": "select.program_6_charging",
+      "values": {
+        "Disabled": "disabled",
+        "Grid": "grid",
+        "Generator": "generator",
+        "Both": "both"
+      },
+      "unverified": true
+    },
+    "tou_program6_power": {
+      "entity": "number.program_6_power",
+      "unverified": true
+    }
+  },
+  "settingsControl": {
+    "family": "deye_tou",
+    "modelKey": "sensor.device",
+    "readback": "solarman.read_holding_registers",
+    "readbackData": {
+      "device": "{device}",
+      "address": "{address}",
+      "count": "{count}"
+    },
+    "readbackMaxCount": 125,
+    "uniqueId": "{entry}_{key}_{platform}",
+    "definitions": {
+      "register": "0x0000",
+      "table": [
+        {
+          "codes": [
+            "0x0003",
+            "0x0300",
+            "0x0103",
+            "0x0104"
+          ],
+          "definition": "deye_hybrid",
+          "variant": null
+        },
+        {
+          "codes": [
+            "0x0005",
+            "0x0500"
+          ],
+          "definition": "deye_p3",
+          "variant": "lp3"
+        },
+        {
+          "codes": [
+            "0x0006",
+            "0x0007",
+            "0x0600",
+            "0x0008",
+            "0x0601"
+          ],
+          "definition": "deye_p3",
+          "variant": "hp3"
+        }
+      ]
+    },
+    "clock": {
+      "entity": "datetime.date_time"
+    },
+    "backupLoad": {
+      "deye_p3": "sensor.load_ups_power",
+      "deye_hybrid": null
+    },
+    "neverTouched": {
+      "deye_p3": [
+        "0x0050",
+        "0x0081",
+        "0x003E",
+        "0x003F",
+        "0x0040"
+      ],
+      "deye_hybrid": [
+        "0x002B",
+        "0x0146",
+        "0x00D6",
+        "0x00E7",
+        "0x0016",
+        "0x0017",
+        "0x0018"
+      ]
+    },
+    "registers": {
+      "deye_p3": {
+        "battery_charge_max_current": {
+          "address": "0x006C",
+          "min": 0,
+          "max": 350
+        },
+        "battery_discharge_max_current": {
+          "address": "0x006D",
+          "min": 0,
+          "max": 350
+        },
+        "export_limit": {
+          "address": "0x008F",
+          "scale": {
+            "lp3": 1,
+            "hp3": 10
+          },
+          "min": 0,
+          "max": {
+            "lp3": 24000,
+            "hp3": 80000
+          }
+        },
+        "work_mode": {
+          "address": "0x008E",
+          "raw": {
+            "0": "feed_in",
+            "1": "zero_export_load",
+            "2": "zero_export_ct"
+          }
+        },
+        "tou_days": {
+          "address": "0x0092",
+          "raw": {
+            "0": "disabled",
+            "3": "monday",
+            "5": "tuesday",
+            "9": "wednesday",
+            "17": "thursday",
+            "33": "friday",
+            "63": "weekdays",
+            "65": "saturday",
+            "127": "week_except_sunday",
+            "129": "sunday",
+            "191": "week_except_saturday",
+            "193": "weekend",
+            "223": "week_except_friday",
+            "239": "week_except_thursday",
+            "247": "week_except_wednesday",
+            "251": "week_except_tuesday",
+            "253": "week_except_monday",
+            "255": "week"
+          },
+          "rawBit0": "enabled"
+        },
+        "tou_program1_start": {
+          "address": "0x0094",
+          "encoding": "hhmm"
+        },
+        "tou_program1_soc": {
+          "address": "0x00A6",
+          "min": 0,
+          "max": 100
+        },
+        "tou_program1_charge": {
+          "address": "0x00AC",
+          "raw": {
+            "0": "disabled",
+            "1": "grid",
+            "2": "generator",
+            "3": "both"
+          }
+        },
+        "tou_program1_power": {
+          "address": "0x009A",
+          "scale": {
+            "lp3": 1,
+            "hp3": 10
+          },
+          "min": 0,
+          "max": {
+            "lp3": 32000,
+            "hp3": 128000
+          }
+        },
+        "tou_program2_start": {
+          "address": "0x0095",
+          "encoding": "hhmm"
+        },
+        "tou_program2_soc": {
+          "address": "0x00A7",
+          "min": 0,
+          "max": 100
+        },
+        "tou_program2_charge": {
+          "address": "0x00AD",
+          "raw": {
+            "0": "disabled",
+            "1": "grid",
+            "2": "generator",
+            "3": "both"
+          }
+        },
+        "tou_program2_power": {
+          "address": "0x009B",
+          "scale": {
+            "lp3": 1,
+            "hp3": 10
+          },
+          "min": 0,
+          "max": {
+            "lp3": 32000,
+            "hp3": 128000
+          }
+        },
+        "tou_program3_start": {
+          "address": "0x0096",
+          "encoding": "hhmm"
+        },
+        "tou_program3_soc": {
+          "address": "0x00A8",
+          "min": 0,
+          "max": 100
+        },
+        "tou_program3_charge": {
+          "address": "0x00AE",
+          "raw": {
+            "0": "disabled",
+            "1": "grid",
+            "2": "generator",
+            "3": "both"
+          }
+        },
+        "tou_program3_power": {
+          "address": "0x009C",
+          "scale": {
+            "lp3": 1,
+            "hp3": 10
+          },
+          "min": 0,
+          "max": {
+            "lp3": 32000,
+            "hp3": 128000
+          }
+        },
+        "tou_program4_start": {
+          "address": "0x0097",
+          "encoding": "hhmm"
+        },
+        "tou_program4_soc": {
+          "address": "0x00A9",
+          "min": 0,
+          "max": 100
+        },
+        "tou_program4_charge": {
+          "address": "0x00AF",
+          "raw": {
+            "0": "disabled",
+            "1": "grid",
+            "2": "generator",
+            "3": "both"
+          }
+        },
+        "tou_program4_power": {
+          "address": "0x009D",
+          "scale": {
+            "lp3": 1,
+            "hp3": 10
+          },
+          "min": 0,
+          "max": {
+            "lp3": 32000,
+            "hp3": 128000
+          }
+        },
+        "tou_program5_start": {
+          "address": "0x0098",
+          "encoding": "hhmm"
+        },
+        "tou_program5_soc": {
+          "address": "0x00AA",
+          "min": 0,
+          "max": 100
+        },
+        "tou_program5_charge": {
+          "address": "0x00B0",
+          "raw": {
+            "0": "disabled",
+            "1": "grid",
+            "2": "generator",
+            "3": "both"
+          }
+        },
+        "tou_program5_power": {
+          "address": "0x009E",
+          "scale": {
+            "lp3": 1,
+            "hp3": 10
+          },
+          "min": 0,
+          "max": {
+            "lp3": 32000,
+            "hp3": 128000
+          }
+        },
+        "tou_program6_start": {
+          "address": "0x0099",
+          "encoding": "hhmm"
+        },
+        "tou_program6_soc": {
+          "address": "0x00AB",
+          "min": 0,
+          "max": 100
+        },
+        "tou_program6_charge": {
+          "address": "0x00B1",
+          "raw": {
+            "0": "disabled",
+            "1": "grid",
+            "2": "generator",
+            "3": "both"
+          }
+        },
+        "tou_program6_power": {
+          "address": "0x009F",
+          "scale": {
+            "lp3": 1,
+            "hp3": 10
+          },
+          "min": 0,
+          "max": {
+            "lp3": 32000,
+            "hp3": 128000
+          }
+        }
+      },
+      "deye_hybrid": {
+        "battery_charge_max_current": {
+          "address": "0x00D2",
+          "min": 0,
+          "max": 240
+        },
+        "battery_discharge_max_current": {
+          "address": "0x00D3",
+          "min": 0,
+          "max": 240
+        },
+        "export_limit": {
+          "address": "0x00F5",
+          "min": 0,
+          "max": 12000
+        },
+        "work_mode": {
+          "address": "0x00F4",
+          "raw": {
+            "0": "feed_in",
+            "1": "zero_export_load",
+            "2": "zero_export_ct"
+          }
+        },
+        "tou_days": {
+          "address": "0x00F8",
+          "raw": {
+            "0": "disabled",
+            "3": "monday",
+            "5": "tuesday",
+            "9": "wednesday",
+            "17": "thursday",
+            "33": "friday",
+            "63": "weekdays",
+            "65": "saturday",
+            "127": "week_except_sunday",
+            "129": "sunday",
+            "191": "week_except_saturday",
+            "193": "weekend",
+            "223": "week_except_friday",
+            "239": "week_except_thursday",
+            "247": "week_except_wednesday",
+            "251": "week_except_tuesday",
+            "253": "week_except_monday",
+            "255": "week"
+          },
+          "rawBit0": "enabled"
+        },
+        "tou_program1_start": {
+          "address": "0x00FA",
+          "encoding": "hhmm"
+        },
+        "tou_program1_soc": {
+          "address": "0x010C",
+          "min": 0,
+          "max": 100
+        },
+        "tou_program1_charge": {
+          "address": "0x0112",
+          "raw": {
+            "0": "disabled",
+            "1": "grid",
+            "2": "generator",
+            "3": "both"
+          }
+        },
+        "tou_program1_power": {
+          "address": "0x0100",
+          "min": 0,
+          "max": 12000
+        },
+        "tou_program2_start": {
+          "address": "0x00FB",
+          "encoding": "hhmm"
+        },
+        "tou_program2_soc": {
+          "address": "0x010D",
+          "min": 0,
+          "max": 100
+        },
+        "tou_program2_charge": {
+          "address": "0x0113",
+          "raw": {
+            "0": "disabled",
+            "1": "grid",
+            "2": "generator",
+            "3": "both"
+          }
+        },
+        "tou_program2_power": {
+          "address": "0x0101",
+          "min": 0,
+          "max": 12000
+        },
+        "tou_program3_start": {
+          "address": "0x00FC",
+          "encoding": "hhmm"
+        },
+        "tou_program3_soc": {
+          "address": "0x010E",
+          "min": 0,
+          "max": 100
+        },
+        "tou_program3_charge": {
+          "address": "0x0114",
+          "raw": {
+            "0": "disabled",
+            "1": "grid",
+            "2": "generator",
+            "3": "both"
+          }
+        },
+        "tou_program3_power": {
+          "address": "0x0102",
+          "min": 0,
+          "max": 12000
+        },
+        "tou_program4_start": {
+          "address": "0x00FD",
+          "encoding": "hhmm"
+        },
+        "tou_program4_soc": {
+          "address": "0x010F",
+          "min": 0,
+          "max": 100
+        },
+        "tou_program4_charge": {
+          "address": "0x0115",
+          "raw": {
+            "0": "disabled",
+            "1": "grid",
+            "2": "generator",
+            "3": "both"
+          }
+        },
+        "tou_program4_power": {
+          "address": "0x0103",
+          "min": 0,
+          "max": 12000
+        },
+        "tou_program5_start": {
+          "address": "0x00FE",
+          "encoding": "hhmm"
+        },
+        "tou_program5_soc": {
+          "address": "0x0110",
+          "min": 0,
+          "max": 100
+        },
+        "tou_program5_charge": {
+          "address": "0x0116",
+          "raw": {
+            "0": "disabled",
+            "1": "grid",
+            "2": "generator",
+            "3": "both"
+          }
+        },
+        "tou_program5_power": {
+          "address": "0x0104",
+          "min": 0,
+          "max": 12000
+        },
+        "tou_program6_start": {
+          "address": "0x00FF",
+          "encoding": "hhmm"
+        },
+        "tou_program6_soc": {
+          "address": "0x0111",
+          "min": 0,
+          "max": 100
+        },
+        "tou_program6_charge": {
+          "address": "0x0117",
+          "raw": {
+            "0": "disabled",
+            "1": "grid",
+            "2": "generator",
+            "3": "both"
+          }
+        },
+        "tou_program6_power": {
+          "address": "0x0105",
+          "min": 0,
+          "max": 12000
+        }
+      }
+    }
+  }
+}

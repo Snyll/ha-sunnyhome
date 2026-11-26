@@ -2,7 +2,11 @@
   "contract": "inverter-settings-v1",
   "profile": "home_assistant.solax_modbus",
   "source": "home_assistant",
+  "controlKeyPrefix": "ha-solax-modbus",
   "exportLimitControl": {
+    "minW": 0,
+    "maxW": 6000,
+    "stepW": 100,
     "entity": "number.export_control_user_limit",
     "unlock": { "entity": "select.lock_state", "option": "Unlocked" },
     "asleep": { "entity": "sensor.run_mode", "states": ["Idle Mode"] }

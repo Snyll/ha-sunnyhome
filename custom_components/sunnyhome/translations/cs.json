@@ -70,6 +70,14 @@
           "inverter_control": "Povolit SunnyHome ovládat režim baterie střídače"
         }
       },
+      "settings_control": {
+        "title": "Ovládání nastavení střídače",
+        "description": "**Upozornění: SunnyHome tím může měnit trvalá nastavení vašeho střídače.**\n\nVáš střídač nemá časově omezený režim dálkového ovládání, proto SunnyHome ovládá baterii změnou nastavení, která platí, dokud je někdo nezmění zpět, například maximální vybíjecí a nabíjecí proud baterie. Home Assistant si před první změnou uloží vaše hodnoty a vrátí je, když SunnyHome skončí (i po restartu), ale jen tam, kde střídač stále ukazuje hodnotu SunnyHome: hodnotu, kterou mezitím změníte vy, nechá být. Pokud se hodnotu nepodaří vrátit ani po {tries} pokusech, SunnyHome vám ukáže původní hodnoty a nic dalšího nemění, dokud nepotvrdíte, že jste je vrátili. Nastavení se pravděpodobně ukládají do paměti střídače, proto SunnyHome mění každé nastavení nejvýše {changes}krát denně. Používají se jen entity nastavení integrace střídače, nikdy přímý zápis do registrů. Nic se neodešle, dokud ovládání střídače nepovolíte také v SunnyHome.\n\n**Záložní výstup:** co střídač s těmito nastaveními udělá při výpadku sítě, zatím nevíme, proto je ovládání odmítnuto, když jsou na záložním výstupu střídače připojené spotřebiče.",
+        "data": {
+          "settings_control": "Povolit SunnyHome měnit nastavení baterie ve střídači",
+          "backup_loads": "Jsou na záložním (UPS) výstupu střídače připojené spotřebiče? (yes = ano / no = ne)"
+        }
+      },
       "wallbox": {
         "title": "Ovládání wallboxu",
         "description": "**Upozornění: SunnyHome tím smí měnit pracovní režim vaší nabíječky SolaX.**\n\nKdyž je zapnuto, pravidla wallboxu v SunnyHome smí přepnout nabíječku vašeho hubu SolaX Modbus EV charger na STOP, FAST, ECO nebo GREEN. FAST nabíjí plným výkonem z jakéhokoli zdroje, i ze sítě. Pro GREEN a ECO nastaví stupeň Green nebo ECO nabíječky na 6 A a zpět ho nevrací. Nikdy nespouští ani neukončuje nabíjení. Nic se neodešle, dokud SunnyHome neověří model, firmware nabíječky a verzi SolaX Modbus a dokud v SunnyHome nepovolíte i ovládání nabíjení elektromobilu.\n\nHome Assistant vrátí nabíječku do běžného režimu wallboxu asi 15 minut poté, co SunnyHome přestane režim obnovovat, i po restartu. Když Home Assistant sám neběží, nabíječka režim podrží. Režim, který změníte ručně, zůstane, jak je. SunnyHome potřebuje, aby hub četl data alespoň každých 30 sekund. Vypnutím se aktivní režim vrátí do běžného režimu.",
@@ -107,6 +115,7 @@
       "number_range": "Číslo nabíjecího proudu potřebuje minimum a maximum, které připouští nějaký proud mezi 6 A a 32 A.",
       "device_not_shareable": "Toto zařízení nelze sdílet celé: patří integraci střídače, baterie nebo energie, používá ho panel Energie, nebo už neexistuje.",
       "too_many_device_entities": "Celá zařízení a seznamy níže mají dohromady víc než 512 entit nebo 512 senzorů.",
+      "backup_loads_required": "Odpovězte, zda jsou na záložním výstupu střídače připojené spotřebiče: ovládání nastavení to potřebuje.",
       "inverter_taken": "Tento střídač už čte jiná položka SunnyHome. Vyberte jiný."
     }
   },
@@ -122,6 +131,18 @@
     "devices_trimmed": {
       "title": "Některé entity celých zařízení se neposílají",
       "description": "Celá zařízení zaškrtnutá v nastavení mají víc entit, než SunnyHome přijme (512 entit a 512 senzorů nebo velikost jednoho hlášení), proto se posílají jen první podle ID entity. Odškrtněte některé zařízení nebo jeho entity sdílejte jednotlivě."
+    },
+    "settings_restore_pending": {
+      "title": "SunnyHome nedokázal vrátit nastavení střídače {inverter}",
+      "description": "SunnyHome změnil nastavení vašeho střídače a nepodařilo se mu vrátit vaše původní hodnoty. Zkontrolujte nastavení střídače a nastavte je sami; původní hodnoty SunnyHome ukazuje na stránce baterie. SunnyHome na střídači nic nemění, dokud tam nepotvrdíte, že jste je vrátili."
+    },
+    "settings_not_restored": {
+      "title": "SunnyHome nevrátil nastavení střídače {inverter}",
+      "description": "SunnyHome změnil nastavení vašeho střídače a nemohl vrátit vaše původní hodnoty (integrace SunnyHome byla odebrána nebo integrace střídače chybí). Nastavte je prosím sami: {values}."
+    },
+    "settings_program_left": {
+      "title": "Program střídače {inverter} si ponechal hodnoty SunnyHome",
+      "description": "Změnili jste dny, kdy program střídače běží, zatímco v něm byl program SunnyHome, proto SunnyHome nechal celý program, jak je: hodnoty SunnyHome v něm teď běží v těchto dnech. Vaše dřívější hodnoty byly: {values}. Pokud chcete svůj vlastní program, nastavte je zpět."
     },
     "wallbox_elsewhere": {
       "title": "Wallbox SolaX ovládá jiná položka SunnyHome",

@@ -26,11 +26,11 @@ from homeassistant.helpers.selector import (
 
 from . import (
     binary_shareable, device_choices, heat_controllable, heat_shareable, inverter_entries, link_inverter, oldest_entry, TITLE, other_wallbox_ids, payload, person_shareable, sensor_shareable,
-    shareable, solax_charger, solax_remote, unshared_entries,
+    settings_inverter, settings_runner, settings_timings, shareable, solax_charger, solax_remote, unshared_entries,
 )
 from .const import (
     CONF_BINARY, CONF_CONTROL, CONF_DEVICES, CONF_ENTITIES, CONF_HEAT, CONF_HUB, CONF_INVERTER, CONF_LINK_ID, CONF_OTHER_WALLBOX, CONF_OW_CURRENT, CONF_OW_ENERGY, CONF_OW_POWER,
-    CONF_OW_STATUS, CONF_OW_SWITCH, CONF_PEOPLE, CONF_SENSORS, CONF_WALLBOX, DEFAULT_URL, DOMAIN,
+    CONF_BACKUP_LOADS, CONF_OW_STATUS, CONF_OW_SWITCH, CONF_PEOPLE, CONF_SENSORS, CONF_SETTINGS_CONTROL, CONF_WALLBOX, DEFAULT_URL, DOMAIN,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -211,21 +211,60 @@ class SunnyHomeOptionsFlow(OptionsFlow):
         current = {CONF_HUB: picked} if (picked := (user_input or self.config_entry.options).get(CONF_HUB)) in {o["value"] for o in options} else {}
         return self.async_show_form(step_id="hub", data_schema=self.add_suggested_values_to_schema(schema, current), errors=errors)
 
+    def _unsaved(self) -> SimpleNamespace:
+        """HA-027: this entry with the options of this flow so far (the inverter it will read)."""
+        return SimpleNamespace(entry_id=self.config_entry.entry_id, options={**self.config_entry.options, **self._data})
+
     async def _inverter_or_wallbox(self) -> ConfigFlowResult:
         """BAT-008: the inverter-control step only with a single hub that has all four entities; else the option is off."""
-        reads = link_inverter(self.hass, SimpleNamespace(entry_id=self.config_entry.entry_id, options={**self.config_entry.options, **self._data}))
+        reads = link_inverter(self.hass, self._unsaved())
         if solax_remote(self.hass) is None or reads is None:  # HA-028: never for an entry that will read no inverter
             self._data[CONF_INVERTER] = False
-            return await self._wallbox_or_done()
+            return await self._settings_or_wallbox()
         return await self.async_step_inverter()
 
     async def async_step_inverter(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """BAT-008: the separate inverter-control opt-in, off by default, with its own warning."""
         if user_input is not None:
             self._data[CONF_INVERTER] = bool(user_input.get(CONF_INVERTER))
-            return await self._wallbox_or_done()
+            return await self._settings_or_wallbox()
         schema = vol.Schema({vol.Required(CONF_INVERTER, default=bool(self.config_entry.options.get(CONF_INVERTER))): bool})
         return self.async_show_form(step_id="inverter", data_schema=schema)
+
+    async def _settings_or_wallbox(self) -> ConfigFlowResult:
+        """DEYE-013: the settings-control step only when the inverter this entry reads (HA-027) has a profile with a settingsControl binding; else the
+        option is off."""
+        if settings_inverter(self.hass, self._unsaved()) is None:
+            self._data[CONF_SETTINGS_CONTROL] = False
+            return await self._wallbox_or_done()
+        return await self.async_step_settings_control()
+
+    async def async_step_settings_control(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """DEYE-013: the persistent-settings opt-in, off by default, with its own warning; the backup-loads answer is required (D3: only "no" lets writes go)."""
+        if user_input is not None:
+            if user_input.get(CONF_SETTINGS_CONTROL) and user_input.get(CONF_BACKUP_LOADS) not in ("yes", "no"):
+                return self.async_show_form(step_id="settings_control", data_schema=self._settings_schema(), errors={CONF_BACKUP_LOADS: "backup_loads_required"},
+                                            description_placeholders=self._settings_numbers())
+            self._data[CONF_SETTINGS_CONTROL] = bool(user_input.get(CONF_SETTINGS_CONTROL))
+            self._data[CONF_BACKUP_LOADS] = user_input.get(CONF_BACKUP_LOADS)
+            return await self._wallbox_or_done()
+        return self.async_show_form(step_id="settings_control", data_schema=self._settings_schema(), description_placeholders=self._settings_numbers())
+
+    def _settings_numbers(self) -> dict[str, str]:
+        """DEYE-030: the warning's numbers from their one definition: the family's daily write budget per setting and the server's restore
+        tries (a dash before SunnyHome has sent them)."""
+        found = settings_inverter(self.hass, self._unsaved())
+        b = settings_runner.binding_of(found[0]) if found else None
+        timings = settings_timings(self.hass, self.config_entry)
+        return {"changes": str(b.capability("writeBudgetPerRegisterPerDay")) if b else "–",
+                "tries": str(len(timings["restoreTryMinutes"])) if timings else "–"}
+
+    def _settings_schema(self) -> vol.Schema:
+        options = self.config_entry.options
+        return vol.Schema({
+            vol.Required(CONF_SETTINGS_CONTROL, default=bool(options.get(CONF_SETTINGS_CONTROL))): bool,
+            vol.Optional(CONF_BACKUP_LOADS, **({"default": options[CONF_BACKUP_LOADS]} if options.get(CONF_BACKUP_LOADS) in ("yes", "no") else {})): vol.In(["yes", "no"]),
+        })
 
     async def _wallbox_or_done(self) -> ConfigFlowResult:
         """EV-004: the Wallbox control step only with one EV-charger hub that has its three selects; else the option is off.

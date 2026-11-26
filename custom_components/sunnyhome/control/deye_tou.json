@@ -1,0 +1,508 @@
+{
+  "contract": "inverter-settings-v1",
+  "family": "deye_tou",
+  "note": "DEYE-022 (docs/28-deye-inverter-control.md sections 4, 5.2 and 5.4): the Deye hybrid control family, shared by the Home Assistant (ha-solarman) and the Deye Cloud path. Roles are catalog keys (inverterSettings.json). intents by IntentKind code: end device = only Time of Use program roles (the inverter ends it at the next program start); end lease = also a global role, restored by the lease holder. A target is {const} (a catalog value), {from} (an input the intent carries: powerW for charge, charge_to_soc and discharge, targetSoc for charge_to_soc, limitW for export_limit; currentSoc and socFloor for any). window: the fields of the program the window takes; otherPrograms: the fields every other program carries while the intent holds. requires: settings the intent reads but never writes. registers: which keys share one register (on Deye each role has its own), with its budget class. Data only: nothing here is written before units 2b, 4 and 5 and the owner switch. touDayValues: the ISO weekdays each touDays value runs on (the rawBit0 catch-all \"enabled\" has none: a value that does not round-trip is never snapshotted). selfUse: the fields of a self-use program slot ({\"owner\": true}: the highest value of that field among the owner's own programs, filled by the Home Assistant component; every slot SOC is at least socFloor, applied by the one program builder). programRequires: settings read before every program write but a restore (a self-use slot under Export First would sell the battery to its floor, docs/28 section 4). floors: the capability each program field may not go below (applied by the one program builder). functionIntents (DEYE-030): intents that are functions of their own, not battery modes (the export limit): never offered as an intent, and a mode's apply never lets go their roles.",
+  "capabilities": {
+    "writeBudgetPerRegisterPerDay": 10,
+    "scheduleSlots": 6,
+    "minSlotMinutes": 30,
+    "windowChunkMinutes": 15,
+    "clockToleranceSeconds": 120,
+    "socFloor": 11,
+    "slotStepMinutes": 5
+  },
+  "slotRoles": [
+    {
+      "start": "tou_program1_start",
+      "soc": "tou_program1_soc",
+      "charge": "tou_program1_charge",
+      "power": "tou_program1_power"
+    },
+    {
+      "start": "tou_program2_start",
+      "soc": "tou_program2_soc",
+      "charge": "tou_program2_charge",
+      "power": "tou_program2_power"
+    },
+    {
+      "start": "tou_program3_start",
+      "soc": "tou_program3_soc",
+      "charge": "tou_program3_charge",
+      "power": "tou_program3_power"
+    },
+    {
+      "start": "tou_program4_start",
+      "soc": "tou_program4_soc",
+      "charge": "tou_program4_charge",
+      "power": "tou_program4_power"
+    },
+    {
+      "start": "tou_program5_start",
+      "soc": "tou_program5_soc",
+      "charge": "tou_program5_charge",
+      "power": "tou_program5_power"
+    },
+    {
+      "start": "tou_program6_start",
+      "soc": "tou_program6_soc",
+      "charge": "tou_program6_charge",
+      "power": "tou_program6_power"
+    }
+  ],
+  "touDays": "tou_days",
+  "touDayValues": {
+    "disabled": [],
+    "monday": [
+      1
+    ],
+    "tuesday": [
+      2
+    ],
+    "wednesday": [
+      3
+    ],
+    "thursday": [
+      4
+    ],
+    "friday": [
+      5
+    ],
+    "saturday": [
+      6
+    ],
+    "sunday": [
+      7
+    ],
+    "weekdays": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "weekend": [
+      6,
+      7
+    ],
+    "week_except_monday": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "week_except_tuesday": [
+      1,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "week_except_wednesday": [
+      1,
+      2,
+      4,
+      5,
+      6,
+      7
+    ],
+    "week_except_thursday": [
+      1,
+      2,
+      3,
+      5,
+      6,
+      7
+    ],
+    "week_except_friday": [
+      1,
+      2,
+      3,
+      4,
+      6,
+      7
+    ],
+    "week_except_saturday": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      7
+    ],
+    "week_except_sunday": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "week": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ]
+  },
+  "selfUse": {
+    "soc": {
+      "from": "socFloor"
+    },
+    "charge": {
+      "const": "disabled"
+    },
+    "power": {
+      "owner": true
+    }
+  },
+  "floors": {
+    "soc": "socFloor"
+  },
+  "programRequires": {
+    "work_mode": {
+      "notIn": [
+        "feed_in"
+      ]
+    }
+  },
+  "registers": {
+    "battery_charge_max_current": {
+      "class": "global",
+      "keys": [
+        "battery_charge_max_current"
+      ]
+    },
+    "battery_discharge_max_current": {
+      "class": "global",
+      "keys": [
+        "battery_discharge_max_current"
+      ]
+    },
+    "work_mode": {
+      "class": "global",
+      "keys": [
+        "work_mode"
+      ]
+    },
+    "export_limit": {
+      "class": "global",
+      "keys": [
+        "export_limit"
+      ]
+    },
+    "tou_days": {
+      "class": "tou_days",
+      "keys": [
+        "tou_days"
+      ]
+    },
+    "tou_program1_start": {
+      "class": "slot",
+      "keys": [
+        "tou_program1_start"
+      ]
+    },
+    "tou_program1_soc": {
+      "class": "slot",
+      "keys": [
+        "tou_program1_soc"
+      ]
+    },
+    "tou_program1_charge": {
+      "class": "slot",
+      "keys": [
+        "tou_program1_charge"
+      ]
+    },
+    "tou_program1_power": {
+      "class": "slot",
+      "keys": [
+        "tou_program1_power"
+      ]
+    },
+    "tou_program2_start": {
+      "class": "slot",
+      "keys": [
+        "tou_program2_start"
+      ]
+    },
+    "tou_program2_soc": {
+      "class": "slot",
+      "keys": [
+        "tou_program2_soc"
+      ]
+    },
+    "tou_program2_charge": {
+      "class": "slot",
+      "keys": [
+        "tou_program2_charge"
+      ]
+    },
+    "tou_program2_power": {
+      "class": "slot",
+      "keys": [
+        "tou_program2_power"
+      ]
+    },
+    "tou_program3_start": {
+      "class": "slot",
+      "keys": [
+        "tou_program3_start"
+      ]
+    },
+    "tou_program3_soc": {
+      "class": "slot",
+      "keys": [
+        "tou_program3_soc"
+      ]
+    },
+    "tou_program3_charge": {
+      "class": "slot",
+      "keys": [
+        "tou_program3_charge"
+      ]
+    },
+    "tou_program3_power": {
+      "class": "slot",
+      "keys": [
+        "tou_program3_power"
+      ]
+    },
+    "tou_program4_start": {
+      "class": "slot",
+      "keys": [
+        "tou_program4_start"
+      ]
+    },
+    "tou_program4_soc": {
+      "class": "slot",
+      "keys": [
+        "tou_program4_soc"
+      ]
+    },
+    "tou_program4_charge": {
+      "class": "slot",
+      "keys": [
+        "tou_program4_charge"
+      ]
+    },
+    "tou_program4_power": {
+      "class": "slot",
+      "keys": [
+        "tou_program4_power"
+      ]
+    },
+    "tou_program5_start": {
+      "class": "slot",
+      "keys": [
+        "tou_program5_start"
+      ]
+    },
+    "tou_program5_soc": {
+      "class": "slot",
+      "keys": [
+        "tou_program5_soc"
+      ]
+    },
+    "tou_program5_charge": {
+      "class": "slot",
+      "keys": [
+        "tou_program5_charge"
+      ]
+    },
+    "tou_program5_power": {
+      "class": "slot",
+      "keys": [
+        "tou_program5_power"
+      ]
+    },
+    "tou_program6_start": {
+      "class": "slot",
+      "keys": [
+        "tou_program6_start"
+      ]
+    },
+    "tou_program6_soc": {
+      "class": "slot",
+      "keys": [
+        "tou_program6_soc"
+      ]
+    },
+    "tou_program6_charge": {
+      "class": "slot",
+      "keys": [
+        "tou_program6_charge"
+      ]
+    },
+    "tou_program6_power": {
+      "class": "slot",
+      "keys": [
+        "tou_program6_power"
+      ]
+    }
+  },
+  "functionIntents": [
+    "export_limit"
+  ],
+  "intents": {
+    "charge": [
+      {
+        "end": "device",
+        "window": {
+          "soc": {
+            "const": 100
+          },
+          "charge": {
+            "const": "grid"
+          },
+          "power": {
+            "from": "powerW"
+          }
+        },
+        "requires": {
+          "grid_charge": {
+            "const": true
+          }
+        }
+      }
+    ],
+    "charge_to_soc": [
+      {
+        "end": "device",
+        "window": {
+          "soc": {
+            "from": "targetSoc"
+          },
+          "charge": {
+            "const": "grid"
+          },
+          "power": {
+            "from": "powerW"
+          }
+        },
+        "requires": {
+          "grid_charge": {
+            "const": true
+          }
+        }
+      }
+    ],
+    "no_discharge": [
+      {
+        "end": "lease",
+        "roles": {
+          "battery_discharge_max_current": {
+            "const": 0
+          }
+        }
+      },
+      {
+        "end": "device",
+        "requiresCheck": "no_discharge_slot",
+        "window": {
+          "soc": {
+            "from": "currentSoc"
+          },
+          "charge": {
+            "const": "disabled"
+          }
+        }
+      }
+    ],
+    "hold": [
+      {
+        "end": "lease",
+        "roles": {
+          "battery_discharge_max_current": {
+            "const": 0
+          },
+          "battery_charge_max_current": {
+            "const": 0
+          }
+        }
+      }
+    ],
+    "charge_hold": [
+      {
+        "end": "lease",
+        "roles": {
+          "battery_discharge_max_current": {
+            "const": 0
+          },
+          "battery_charge_max_current": {
+            "const": 0
+          }
+        }
+      }
+    ],
+    "discharge": [
+      {
+        "end": "lease",
+        "roles": {
+          "work_mode": {
+            "const": "feed_in"
+          },
+          "export_limit": {
+            "from": "powerW"
+          }
+        },
+        "window": {
+          "soc": {
+            "from": "socFloor"
+          },
+          "charge": {
+            "const": "disabled"
+          }
+        },
+        "otherPrograms": {
+          "soc": {
+            "from": "currentSoc"
+          }
+        }
+      }
+    ],
+    "export_limit": [
+      {
+        "end": "lease",
+        "roles": {
+          "export_limit": {
+            "from": "limitW"
+          }
+        }
+      }
+    ]
+  },
+  "operationCosts": {
+    "midnight": {
+      "slot": 1,
+      "tou_days": 1
+    },
+    "rewrite": {
+      "slot": 1,
+      "tou_days": 2
+    },
+    "insert": {
+      "slot": 1,
+      "tou_days": 2
+    },
+    "extension": {
+      "slot": 1,
+      "tou_days": 0
+    },
+    "slotRestore": {
+      "slot": 1,
+      "tou_days": 2
+    }
+  },
+  "maxPerDay": {
+    "rewrite": 1,
+    "insert": 1,
+    "extension": 2
+  }
+}

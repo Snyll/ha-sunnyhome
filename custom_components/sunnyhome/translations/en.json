@@ -70,6 +70,14 @@
           "inverter_control": "Allow SunnyHome to control the inverter's battery mode"
         }
       },
+      "settings_control": {
+        "title": "Inverter settings control",
+        "description": "**Warning: this lets SunnyHome change lasting settings of your inverter.**\n\nYour inverter has no timed remote mode, so SunnyHome controls its battery by changing settings that stay until they are written back, such as the battery's maximum discharge and charge current. Home Assistant takes a copy of your own values before the first change and puts them back when SunnyHome stops (also after a restart), but only where the inverter still shows SunnyHome's value: a value you changed meanwhile is left alone. If a value cannot be put back after {tries} tries, SunnyHome tells you the original values and changes nothing until you confirm you have restored them. These settings are probably stored in the inverter's memory, so SunnyHome limits itself to {changes} changes of each setting a day. Only the setting entities of the inverter integration are used, never raw register writes. Nothing is sent unless you also allow inverter control in SunnyHome.\n\n**Backup loads:** what an inverter does with these settings during a power cut is not known yet, so control is refused when the house has loads on the inverter's backup output.",
+        "data": {
+          "settings_control": "Allow SunnyHome to change the inverter's battery settings",
+          "backup_loads": "Are any loads connected to the inverter's backup (UPS) output? (yes / no)"
+        }
+      },
       "wallbox": {
         "title": "Wallbox control",
         "description": "**Warning: this lets SunnyHome change the work mode of your SolaX EV charger.**\n\nWhen on, SunnyHome's wallbox rules may set the charger of your SolaX Modbus EV charger hub to STOP, FAST, ECO or GREEN. FAST charges at full power from any source, including the grid. For GREEN and ECO it sets the charger's Green gear or ECO gear to 6 A and does not set it back. It never starts or stops a charging session. Nothing is sent unless SunnyHome has verified your charger model, firmware and SolaX Modbus version, and you also allow EV charging control in SunnyHome.\n\nHome Assistant returns the charger to the wallbox's normal mode about 15 minutes after SunnyHome stops renewing a mode, also after a restart. If Home Assistant itself is down, the charger keeps the mode. A mode you change by hand is left as it is. SunnyHome needs the hub to scan every 30 seconds or faster. Turning this off returns an active mode to the normal mode.",
@@ -107,6 +115,7 @@
       "number_range": "The charging current number needs a minimum and a maximum that allow some current between 6 A and 32 A.",
       "device_not_shareable": "This device cannot be shared as a whole: it belongs to an inverter, battery or energy integration, the Energy dashboard uses it, or it is gone.",
       "too_many_device_entities": "The whole devices and the lists below have more than 512 entities or 512 sensors together.",
+      "backup_loads_required": "Answer whether loads are connected to the inverter's backup output: settings control needs it.",
       "inverter_taken": "Another SunnyHome entry already reads this inverter. Pick another one."
     }
   },
@@ -122,6 +131,18 @@
     "devices_trimmed": {
       "title": "Some entities of whole devices are not sent",
       "description": "The whole devices ticked in the options have more entities than SunnyHome takes (512 entities and 512 sensors, or the size of one report), so only the first ones by entity id are sent. Untick a device or share its entities one by one."
+    },
+    "settings_restore_pending": {
+      "title": "SunnyHome could not restore the settings of inverter {inverter}",
+      "description": "SunnyHome changed settings of your inverter and could not put your own values back. Check the inverter settings and set them yourself; SunnyHome shows the original values on its battery page. SunnyHome changes nothing on the inverter until you confirm there that you have restored them."
+    },
+    "settings_not_restored": {
+      "title": "SunnyHome could not put the settings of inverter {inverter} back",
+      "description": "SunnyHome changed settings of your inverter and could not put your own values back (the SunnyHome integration was removed, or the inverter's integration is gone). Please set them yourself: {values}."
+    },
+    "settings_program_left": {
+      "title": "The program of inverter {inverter} kept SunnyHome's values",
+      "description": "You changed the days your inverter's program runs while SunnyHome's program was in it, so SunnyHome left the whole program as it is: SunnyHome's values in it now run on those days. Your own earlier values were: {values}. Set them back if you want your own program."
     },
     "wallbox_elsewhere": {
       "title": "SolaX wallbox is controlled by another SunnyHome entry",
